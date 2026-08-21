@@ -15,7 +15,6 @@ import {
     pullOutImages,
     highlightWithoutNotification,
     highlightKeysToPatterns,
-    removeStandaloneObjectReplacementCharacterParagraphs,
 } from '@components/markdown/transform';
 import {logError} from '@utils/log';
 
@@ -25,45 +24,6 @@ import type {UserMentionKey} from '@typings/global/markdown';
 
 describe('Components.Markdown.transform', () => {
     const parser = new Parser();
-
-    describe('removeStandaloneObjectReplacementCharacterParagraphs', () => {
-        const tests = [{
-            name: 'standalone paragraph',
-            input: '\uFFFC',
-            expected: '',
-        }, {
-            name: 'standalone paragraph before text',
-            input: '\uFFFC\n\ntext',
-            expected: 'text',
-        }, {
-            name: 'standalone paragraph after text',
-            input: 'text\n\n\uFFFC',
-            expected: 'text',
-        }, {
-            name: 'soft break before text',
-            input: '\uFFFC\ntext',
-            expected: '\uFFFC\ntext',
-        }, {
-            name: 'soft break after text',
-            input: 'text\n\uFFFC',
-            expected: 'text\n\uFFFC',
-        }, {
-            name: 'inline character',
-            input: 'text \uFFFC text',
-            expected: 'text \uFFFC text',
-        }];
-
-        for (const test of tests) {
-            it(`should handle ${test.name}`, () => {
-                const actual = removeStandaloneObjectReplacementCharacterParagraphs(parser.parse(test.input));
-                const expected = parser.parse(test.expected);
-
-                assert.ok(verifyAst(actual));
-                assert.deepStrictEqual(astToString(actual), astToString(expected));
-                assert.deepStrictEqual(stripUnusedFields(actual), stripUnusedFields(expected));
-            });
-        }
-    });
 
     describe('combineTextNodes', () => {
         const tests = [{

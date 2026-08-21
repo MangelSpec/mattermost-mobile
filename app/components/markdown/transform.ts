@@ -16,33 +16,6 @@ import type {DeepLinkChannel, DeepLinkPermalink} from '@typings/launch';
 
 const cjkPattern = /[\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uff9f\u4e00-\u9faf\u3400-\u4dbf\uac00-\ud7a3]/;
 
-// Android reports a negative text width when this copy-paste artifact is its own paragraph.
-export function removeStandaloneObjectReplacementCharacterParagraphs(ast: Node) {
-    const paragraphs: Node[] = [];
-    const walker = ast.walker();
-
-    let event;
-    while ((event = walker.next())) {
-        const node = event.node;
-        const child = node.firstChild;
-        if (
-            event.entering &&
-            node.type === 'paragraph' &&
-            child === node.lastChild &&
-            child?.type === 'text' &&
-            child.literal === '\uFFFC'
-        ) {
-            paragraphs.push(node);
-        }
-    }
-
-    for (const paragraph of paragraphs) {
-        paragraph.unlink();
-    }
-
-    return ast;
-}
-
 // Combines adjacent text nodes into a single text node to make further transformation easier
 export function combineTextNodes(ast: any) {
     const walker = ast.walker();

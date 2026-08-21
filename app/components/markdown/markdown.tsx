@@ -38,7 +38,7 @@ import MarkdownTable from './markdown_table';
 import MarkdownTableCell, {type MarkdownTableCellProps} from './markdown_table_cell';
 import MarkdownTableImage from './markdown_table_image';
 import MarkdownTableRow, {type MarkdownTableRowProps} from './markdown_table_row';
-import {addListItemIndices, combineTextNodes, highlightMentions, highlightWithoutNotification, highlightSearchPatterns, parseTaskLists, processInlineEntities, pullOutImages, removeStandaloneObjectReplacementCharacterParagraphs} from './transform';
+import {addListItemIndices, combineTextNodes, highlightMentions, highlightWithoutNotification, highlightSearchPatterns, parseTaskLists, processInlineEntities, pullOutImages} from './transform';
 
 import type {ChannelMentions} from './channel_mention/channel_mention';
 import type {
@@ -722,8 +722,8 @@ const Markdown = ({
         const startTime = performance.now();
         let ast;
         try {
-            ast = parser.parse(value.toString());
-            ast = removeStandaloneObjectReplacementCharacterParagraphs(ast);
+            const markdownValue = value.toString().replace(/\uFFFC/g, '');
+            ast = parser.parse(markdownValue);
 
             ast = combineTextNodes(ast);
             ast = addListItemIndices(ast);
