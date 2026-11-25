@@ -2,17 +2,19 @@
 // See LICENSE.txt for license information.
 
 import React, {useCallback, useMemo} from 'react';
-import {DeviceEventEmitter, FlatList, type ListRenderItemInfo, type StyleProp, type ViewStyle} from 'react-native';
+import {FlatList, type ListRenderItemInfo, type StyleProp, type ViewStyle} from 'react-native';
 
 import FormattedText from '@components/formatted_text';
 import NoResultsWithTerm from '@components/no_results_with_term';
 import DateSeparator from '@components/post_list/date_separator';
 import PostWithChannelInfo from '@components/post_with_channel_info';
-import {Events, Screens} from '@constants';
+import {Screens} from '@constants';
 import {PostConfigProvider} from '@context/post_config';
 import {useTheme} from '@context/theme';
+import {useClearViewableItemsOnUnmount} from '@hooks/in_viewport';
 import {convertSearchTermToRegex, parseSearchTerms} from '@utils/markdown';
 import {getDateForDateLine, selectOrderedPosts} from '@utils/post_list';
+import {emitPostsInViewport} from '@utils/post_list/viewport';
 import {TabTypes} from '@utils/search';
 import {makeStyleSheetFromTheme} from '@utils/theme';
 import {typography} from '@utils/typography';
@@ -52,6 +54,7 @@ const PostResults = ({
     searchValue,
 }: Props) => {
     const theme = useTheme();
+    useClearViewableItemsOnUnmount(Screens.SEARCH);
     const styles = getStyles(theme);
     const orderedPosts = useMemo(() => selectOrderedPosts(posts, 0, false, '', '', false, currentTimezone, false).reverse(), [currentTimezone, posts]);
     const containerStyle = useMemo(() => ([paddingTop, {flexGrow: 1}]), [paddingTop]);
@@ -108,14 +111,7 @@ const PostResults = ({
             return;
         }
 
-        const viewableItemsMap = viewableItems.reduce((acc: Record<string, boolean>, {item, isViewable}) => {
-            if (isViewable && item.type === 'post') {
-                acc[`${Screens.SEARCH}-${item.value.currentPost.id}`] = true;
-            }
-            return acc;
-        }, {});
-
-        DeviceEventEmitter.emit(Events.ITEM_IN_VIEWPORT, viewableItemsMap);
+        emitPostsInViewport(Screens.SEARCH, viewableItems);
     }, []);
 
     return (

@@ -18,8 +18,6 @@ import UserHandler, {type UserHandlerMix} from '@database/operator/server_data_o
 import PlaybookHandler, {type PlaybookHandlerMix} from '@playbooks/database/operators/handlers';
 import mix from '@utils/mix';
 
-import type {Database} from '@nozbe/watermelondb';
-
 interface ServerDataOperator extends
     AgentsHandlerMix,
     BoardsHandlerMix,
@@ -51,11 +49,6 @@ class ServerDataOperator extends mix(ServerDataOperatorBase).with(
     ThreadHandler,
     TeamThreadsSyncHandler,
     UserHandler,
-) {
-    // eslint-disable-next-line no-useless-constructor
-    constructor(database: Database) {
-        super(database);
-    }
-}
+) {}
 
 export default ServerDataOperator;

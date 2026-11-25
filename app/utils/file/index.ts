@@ -8,15 +8,17 @@ import mimeDB from 'mime-db';
 import {Alert, Linking, Platform} from 'react-native';
 import Permissions, {PERMISSIONS} from 'react-native-permissions';
 
-import {Files} from '@constants';
+import {Files, ServerErrors} from '@constants';
+import {getFullErrorMessage} from '@utils/errors';
 import {generateId} from '@utils/general';
 import keyMirror from '@utils/key_mirror';
-import {logError} from '@utils/log';
+import {logDebug, logError} from '@utils/log';
 import {getIOSAppGroupDetails} from '@utils/mattermost_managed';
 import {urlSafeBase64Encode} from '@utils/security';
 
 import type {PastedFile} from '@mattermost/react-native-paste-input';
 import type {DocumentPickerResponse} from '@react-native-documents/picker';
+import type {RevokedFile} from '@typings/database/database';
 import type FileModel from '@typings/database/models/servers/file';
 import type {IntlShape} from 'react-intl';
 import type {Asset} from 'react-native-image-picker';
@@ -162,6 +164,37 @@ export function deleteFileCacheByDir(dir: string) {
     deleteFilesInDir(cacheDir);
 
     return true;
+}
+
+/**
+ * Per-file eviction, for when the server confirms a denial: removing the file records does not
+ * remove the downloaded bytes, which would stay readable on disk. Each file is looked for both where
+ * it was saved and where downloads land by default, because opening a document never records its path.
+ * Failures are swallowed: a file that cannot be removed must not stop the denial being recorded.
+ */
+export function deleteDownloadedFiles(serverUrl: string, files: RevokedFile[]) {
+    for (const f of files) {
+        const paths = new Set<string>();
+        if (f.localPath) {
+            try {
+                paths.add(decodeURIComponent(f.localPath));
+            } catch {
+                paths.add(f.localPath);
+            }
+        }
+        paths.add(getLocalFilePathFromFile(serverUrl, f));
+
+        for (const path of paths) {
+            try {
+                const file = new File(pathWithPrefix('file://', path));
+                if (file.exists) {
+                    file.delete();
+                }
+            } catch (error) {
+                logDebug('deleteDownloadedFiles: could not remove a cached file', getFullErrorMessage(error));
+            }
+        }
+    }
 }
 
 function deleteFilesInDir(directory: string) {
@@ -380,7 +413,7 @@ export function getFileType(file: FileInfo | ExtractedFileInfo): string {
     }) || 'other';
 }
 
-export function getLocalFilePathFromFile(serverUrl: string, file: FileInfo | FileModel) {
+export function getLocalFilePathFromFile(serverUrl: string, file: Pick<FileInfo, 'id' | 'name' | 'extension' | 'mime_type'> | FileModel) {
     const fileIdPath = file.id?.replace(/[^0-9a-z]/g, '');
     if (serverUrl) {
         const server = urlSafeBase64Encode(serverUrl);
@@ -487,7 +520,20 @@ export function uploadDisabledWarning(intl: IntlShape) {
     });
 }
 
+export function uploadDisabledByPolicyWarning(intl: IntlShape) {
+    return intl.formatMessage({
+        id: 'mobile.file_upload.disabled_by_policy',
+        defaultMessage: 'File uploads are restricted in this channel',
+    });
+}
+
 export function getUploadErrorMessage(intl: IntlShape, errorMessage: string, errorName?: string) {
+    // The client may not know about a denial yet (the decision is still loading or went stale), so the
+    // server's own refusal is shown in the same words the disabled button would have used.
+    if (errorName === ServerErrors.UPLOAD_DENIED_BY_POLICY_ERROR) {
+        return uploadDisabledByPolicyWarning(intl);
+    }
+
     // iOS: Alamofire wraps all network errors with this prefix
     const isIosNetworkError = errorMessage.startsWith('URLSessionTask failed with error:');
 

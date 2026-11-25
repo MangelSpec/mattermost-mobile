@@ -5,6 +5,7 @@ import RNUtils from '@mattermost/rnutils';
 
 import {markChannelAsViewed} from '@actions/local/channel';
 import {autoCacheCleanup} from '@actions/local/ephemeral_mode/cleanup';
+import {hasUnverifiedAttachmentPostsInThread} from '@actions/local/post';
 import {dataRetentionCleanup, expiredBoRPostCleanup, performVacuum} from '@actions/local/systems';
 import {markChannelAsRead} from '@actions/remote/channel';
 import {fetchAccessControlAttributeFields, fetchChannelAttributeValues} from '@actions/remote/classification';
@@ -18,6 +19,7 @@ import {flushAuditQueue} from '@actions/remote/ephemeral_mode';
 import {fetchPostsForChannel, fetchPostThread} from '@actions/remote/post';
 import {openAllUnreadChannels} from '@actions/remote/preference';
 import {autoUpdateTimezone} from '@actions/remote/user';
+import {invalidateRedactionOnResync} from '@actions/websocket/access_control';
 import {checkIsAgentsPluginEnabled} from '@agents/actions/remote/agents_status';
 import {handleAgentsReconnect} from '@agents/actions/websocket/reconnect';
 import {loadConfigAndCalls} from '@calls/actions/calls';
@@ -35,6 +37,7 @@ import {
     getCurrentTeamId,
     getLicense,
     getLastFullSync,
+    isRedactionEnforced,
     setLastFullSync,
 } from '@queries/servers/system';
 import {getIsCRTEnabled} from '@queries/servers/thread';
@@ -96,7 +99,13 @@ async function doReconnect(serverUrl: string, groupLabel?: BaseRequestGroupLabel
         }
 
         logInfo('WEBSOCKET RECONNECT MODELS BATCHING TOOK', `${Date.now() - dt}ms`);
-        await fetchPostDataIfNeeded(serverUrl, groupLabel);
+
+        // Every path here may have lost websocket events, so any ABAC change they carried is gone.
+        // Awaited so the epoch is raised before the fetch below captures it, and placed after
+        // entry() commits its config models so the predicate reads the server's current state.
+        const epochRaised = await invalidateRedactionOnResync(serverUrl);
+
+        await fetchPostDataIfNeeded(serverUrl, epochRaised, groupLabel);
 
         const {id: currentUserId, locale: currentUserLocale} = (await getCurrentUser(database))!;
         const license = await getLicense(database);
@@ -155,7 +164,7 @@ async function doCleanup(serverUrl: string) {
     }
 }
 
-async function fetchPostDataIfNeeded(serverUrl: string, groupLabel?: RequestGroupLabel) {
+async function fetchPostDataIfNeeded(serverUrl: string, epochRaised: boolean, groupLabel?: RequestGroupLabel) {
     try {
         const isActiveServer = (await getActiveServerUrl()) === serverUrl;
         if (!isActiveServer) {
@@ -165,6 +174,11 @@ async function fetchPostDataIfNeeded(serverUrl: string, groupLabel?: RequestGrou
         const {database} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
         const currentChannelId = await getCurrentChannelId(database);
         const isCRTEnabled = await getIsCRTEnabled(database);
+
+        // Neither a since-fetch nor a fromCreateAt thread fetch can re-deliver a post whose only
+        // change was its redaction state. A page follows only when stored posts with attachments
+        // are behind the raised epoch, or always when the epoch could not be raised to mark them.
+        const forceReverification = !epochRaised && await isRedactionEnforced(database);
         const mountedScreens = NavigationStore.getScreensInStack();
         const isChannelScreenMounted = mountedScreens.includes(Screens.CHANNEL);
         const isThreadScreenMounted = mountedScreens.includes(Screens.THREAD);
@@ -176,20 +190,19 @@ async function fetchPostDataIfNeeded(serverUrl: string, groupLabel?: RequestGrou
             const rootId = EphemeralStore.getCurrentThreadId();
             if (rootId) {
                 const lastPost = await getLastPostInThread(database, rootId);
-                if (lastPost) {
-                    if (lastPost) {
-                        const options: FetchPaginatedThreadOptions = {};
-                        options.fromCreateAt = lastPost.createAt;
-                        options.fromPost = lastPost.id;
-                        options.direction = 'down';
-                        await fetchPostThread(serverUrl, rootId, options, false, groupLabel);
-                    }
+                const needsPage = forceReverification || await hasUnverifiedAttachmentPostsInThread(database, rootId);
+                const options: FetchPaginatedThreadOptions = {};
+                if (lastPost && !needsPage) {
+                    options.fromCreateAt = lastPost.createAt;
+                    options.fromPost = lastPost.id;
+                    options.direction = 'down';
                 }
+                await fetchPostThread(serverUrl, rootId, options, false, groupLabel);
             }
         }
 
         if (currentChannelId && (isChannelScreenMounted || tabletDevice)) {
-            await fetchPostsForChannel(serverUrl, currentChannelId, false, false, groupLabel);
+            await fetchPostsForChannel(serverUrl, currentChannelId, false, false, groupLabel, forceReverification);
             markChannelAsRead(serverUrl, currentChannelId, false, groupLabel);
             if (!EphemeralStore.wasNotificationTapped()) {
                 markChannelAsViewed(serverUrl, currentChannelId, true);

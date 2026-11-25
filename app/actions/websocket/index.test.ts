@@ -6,6 +6,7 @@ import {DeviceEventEmitter} from 'react-native';
 
 import {markChannelAsViewed} from '@actions/local/channel';
 import {autoCacheCleanup} from '@actions/local/ephemeral_mode/cleanup';
+import {hasUnverifiedAttachmentPostsInThread} from '@actions/local/post';
 import {dataRetentionCleanup, expiredBoRPostCleanup, performVacuum} from '@actions/local/systems';
 import {markChannelAsRead} from '@actions/remote/channel';
 import {entry, handleEntryAfterLoadNavigation} from '@actions/remote/entry/common';
@@ -13,6 +14,7 @@ import {deferredAppEntryActions} from '@actions/remote/entry/deferred';
 import {flushAuditQueue} from '@actions/remote/ephemeral_mode';
 import {fetchPostsForChannel, fetchPostThread} from '@actions/remote/post';
 import {openAllUnreadChannels} from '@actions/remote/preference';
+import {invalidateRedactionOnResync} from '@actions/websocket/access_control';
 import {loadConfigAndCalls} from '@calls/actions/calls';
 import {isSupportedServerCalls} from '@calls/utils';
 import DatabaseManager from '@database/manager';
@@ -21,7 +23,7 @@ import SessionAttributesManager from '@managers/session_attributes_manager';
 import {handlePlaybookReconnect} from '@playbooks/actions/websocket/reconnect';
 import {getActiveServerUrl} from '@queries/app/servers';
 import {getLastPostInThread} from '@queries/servers/post';
-import {getConfig, getCurrentChannelId, getCurrentTeamId, setLastFullSync} from '@queries/servers/system';
+import {getConfig, getCurrentChannelId, getCurrentTeamId, isRedactionEnforced, setLastFullSync} from '@queries/servers/system';
 import {getIsCRTEnabled} from '@queries/servers/thread';
 import {getCurrentUser} from '@queries/servers/user';
 import EphemeralStore from '@store/ephemeral_store';
@@ -32,6 +34,7 @@ import {handleFirstConnect, handleReconnect} from './index';
 
 jest.mock('@actions/local/channel');
 jest.mock('@actions/local/ephemeral_mode/cleanup');
+jest.mock('@actions/local/post');
 jest.mock('@actions/local/systems');
 jest.mock('@actions/remote/channel');
 jest.mock('@actions/remote/ephemeral_mode');
@@ -41,6 +44,7 @@ jest.mock('@actions/remote/post');
 jest.mock('@actions/remote/scheduled_post');
 jest.mock('@actions/remote/preference');
 jest.mock('@actions/remote/user');
+jest.mock('@actions/websocket/access_control');
 jest.mock('@calls/actions/calls');
 jest.mock('@calls/utils');
 jest.mock('@database/manager');
@@ -141,6 +145,9 @@ describe('WebSocket Index Actions', () => {
             jest.mocked(getCurrentChannelId).mockResolvedValue(currentChannelId);
             jest.mocked(getCurrentTeamId).mockResolvedValue(currentTeamId);
             jest.mocked(getIsCRTEnabled).mockResolvedValue(false);
+            jest.mocked(isRedactionEnforced).mockResolvedValue(false);
+            jest.mocked(invalidateRedactionOnResync).mockResolvedValue(true);
+            jest.mocked(hasUnverifiedAttachmentPostsInThread).mockResolvedValue(false);
             jest.mocked(EphemeralStore.getCurrentThreadId).mockReturnValue('');
             jest.mocked(EphemeralStore.wasNotificationTapped).mockReturnValue(false);
         });
@@ -207,15 +214,76 @@ describe('WebSocket Index Actions', () => {
             jest.mocked(NavigationStore.getScreensInStack).mockReturnValue(['channel']);
             await handleReconnect(serverUrl);
 
-            expect(fetchPostsForChannel).toHaveBeenCalledWith(serverUrl, currentChannelId, false, false, 'WebSocket Reconnect');
+            expect(fetchPostsForChannel).toHaveBeenCalledWith(serverUrl, currentChannelId, false, false, 'WebSocket Reconnect', false);
             expect(markChannelAsRead).toHaveBeenCalledWith(serverUrl, currentChannelId, false, 'WebSocket Reconnect');
             expect(markChannelAsViewed).toHaveBeenCalledWith(serverUrl, currentChannelId, true);
         });
 
-        it('should fetch thread posts when CRT enabled', async () => {
+        it('should raise the redaction epoch on a reconnect before fetching the visible channel', async () => {
+            // A reconnect only reaches doReconnect when the server could not replay the missed events,
+            // so an ABAC change made while disconnected is known only through this invalidation.
+            jest.mocked(entry).mockResolvedValue({
+                models: [],
+                initialTeamId: currentTeamId,
+                initialChannelId: currentChannelId,
+                prefData: {preferences: []},
+                teamData: {memberships: [], teams: []},
+                chData: {memberships: [], channels: []},
+                gmConverted: false,
+            });
+            jest.mocked(getCurrentUser).mockResolvedValue(TestHelper.fakeUserModel({id: currentUserId}));
+            jest.mocked(NavigationStore.getScreensInStack).mockReturnValue(['channel']);
+
+            await handleReconnect(serverUrl);
+
+            expect(invalidateRedactionOnResync).toHaveBeenCalledWith(serverUrl);
+            expect(jest.mocked(invalidateRedactionOnResync).mock.invocationCallOrder[0]).
+                toBeLessThan(jest.mocked(fetchPostsForChannel).mock.invocationCallOrder[0]);
+        });
+
+        it('should not force a page for the visible channel when the epoch was raised', async () => {
+            // The raised epoch marks cached posts as stale, so fetchPostsForChannel pages only when
+            // posts with attachments are behind it.
+            jest.mocked(isRedactionEnforced).mockResolvedValue(true);
+            jest.mocked(NavigationStore.getScreensInStack).mockReturnValue(['channel']);
+
+            await handleReconnect(serverUrl);
+
+            expect(fetchPostsForChannel).toHaveBeenCalledTimes(1);
+            expect(fetchPostsForChannel).toHaveBeenCalledWith(serverUrl, currentChannelId, false, false, 'WebSocket Reconnect', false);
+        });
+
+        it('should force a page for the visible channel when the epoch could not be raised while enforced', async () => {
+            jest.mocked(isRedactionEnforced).mockResolvedValue(true);
+            jest.mocked(invalidateRedactionOnResync).mockResolvedValue(false);
+            jest.mocked(NavigationStore.getScreensInStack).mockReturnValue(['channel']);
+
+            await handleReconnect(serverUrl);
+
+            expect(fetchPostsForChannel).toHaveBeenCalledTimes(1);
+            expect(fetchPostsForChannel).toHaveBeenCalledWith(serverUrl, currentChannelId, false, false, 'WebSocket Reconnect', true);
+        });
+
+        it('should fetch the newest thread page when the thread has unverified attachments', async () => {
+            const threadId = 'thread-id';
+            jest.mocked(isRedactionEnforced).mockResolvedValue(true);
+            jest.mocked(NavigationStore.getScreensInStack).mockReturnValue(['thread']);
+            jest.mocked(getIsCRTEnabled).mockResolvedValue(true);
+            jest.mocked(EphemeralStore.getCurrentThreadId).mockReturnValue(threadId);
+            jest.mocked(getLastPostInThread).mockResolvedValue(TestHelper.fakePostModel({id: 'post-id', createAt: 123}));
+            jest.mocked(hasUnverifiedAttachmentPostsInThread).mockResolvedValue(true);
+
+            await handleReconnect(serverUrl);
+
+            expect(fetchPostThread).toHaveBeenCalledTimes(1);
+            expect(fetchPostThread).toHaveBeenCalledWith(serverUrl, threadId, {}, false, 'WebSocket Reconnect');
+        });
+
+        it('should fetch thread posts incrementally when CRT enabled and the thread has no unverified attachments', async () => {
             const threadId = 'thread-id';
             const lastPost = TestHelper.fakePostModel({id: 'post-id', createAt: 123});
 
+            jest.mocked(isRedactionEnforced).mockResolvedValue(true);
             jest.mocked(NavigationStore.getScreensInStack).mockReturnValue(['thread']);
 
             jest.mocked(getIsCRTEnabled).mockResolvedValue(true);

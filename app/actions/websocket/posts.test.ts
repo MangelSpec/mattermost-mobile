@@ -5,11 +5,15 @@ import {DeviceEventEmitter} from 'react-native';
 
 import {markChannelAsViewed, markChannelAsUnread, storeMyChannelsForTeam, updateLastPostAt} from '@actions/local/channel';
 import {addPostAcknowledgement, markPostAsDeleted, removePostAcknowledgement} from '@actions/local/post';
+import * as Redaction from '@actions/local/redaction';
 import {updateThread} from '@actions/local/thread';
 import {fetchChannelStats, fetchMyChannel} from '@actions/remote/channel';
 import {fetchPostAuthors} from '@actions/remote/post';
 import {fetchThread} from '@actions/remote/thread';
 import {fetchMissingProfilesByIds} from '@actions/remote/user';
+import {settleStreamedPost} from '@agents/actions/websocket';
+import {AGENT_POST_TYPES} from '@agents/constants';
+import streamingStore from '@agents/store/streaming_store';
 import {Events, Screens} from '@constants';
 import {PostTypes} from '@constants/post';
 import DatabaseManager from '@database/manager';
@@ -21,7 +25,9 @@ import {getIsCRTEnabled} from '@queries/servers/thread';
 import EphemeralStore from '@store/ephemeral_store';
 import {NavigationStore} from '@store/navigation_store';
 import TestHelper from '@test/test_helper';
+import {deleteDownloadedFiles} from '@utils/file';
 import {isTablet} from '@utils/helpers';
+import {logError} from '@utils/log';
 import {shouldIgnorePost} from '@utils/post';
 
 import {handleNewPostEvent, handlePostEdited, handlePostDeleted, handlePostUnread, handlePostAcknowledgementAdded, handlePostAcknowledgementRemoved} from './posts';
@@ -33,12 +39,20 @@ jest.mock('@queries/servers/channel');
 jest.mock('@queries/servers/system');
 jest.mock('@queries/servers/thread');
 jest.mock('@actions/local/channel');
-jest.mock('@actions/local/post');
+jest.mock('@actions/local/post', () => ({
+    ...jest.createMockFromModule<typeof import('@actions/local/post')>('@actions/local/post'),
+    batchRecordsAndDeleteRevokedFiles: jest.requireActual('@actions/local/post').batchRecordsAndDeleteRevokedFiles,
+}));
 jest.mock('@actions/local/thread');
 jest.mock('@actions/remote/channel');
 jest.mock('@actions/remote/post');
 jest.mock('@actions/remote/thread');
 jest.mock('@actions/remote/user');
+jest.mock('@agents/actions/websocket', () => ({settleStreamedPost: jest.fn()}));
+jest.mock('@utils/file', () => ({
+    ...jest.requireActual('@utils/file'),
+    deleteDownloadedFiles: jest.fn(),
+}));
 jest.mock('@utils/helpers');
 jest.mock('@utils/post', () => ({
     ...jest.requireActual('@utils/post'),
@@ -111,7 +125,7 @@ describe('WebSocket Post Actions', () => {
             const userModel = TestHelper.fakeUserModel({id: 'user1', username: 'username1'});
             const emitSpy = jest.spyOn(DeviceEventEmitter, 'emit');
             const batchRecordsSpy = jest.spyOn(operator, 'batchRecords').mockImplementation(jest.fn());
-            jest.spyOn(operator, 'handlePosts').mockResolvedValue(postModels);
+            jest.spyOn(operator, 'handlePosts').mockResolvedValue({models: postModels, revokedFiles: []});
             jest.spyOn(operator, 'handleUsers').mockResolvedValue([userModel]);
 
             mockedFetchPostAuthors.mockResolvedValueOnce({authors: [TestHelper.fakeUser({id: 'user1', username: 'username1'})]});
@@ -138,7 +152,7 @@ describe('WebSocket Post Actions', () => {
                     messageCount: 4,
                 }),
                 postModels[0],
-            ], 'handleNewPostEvent');
+            ], 'handleNewPostEvent', true);
         });
 
         it.each([
@@ -152,7 +166,7 @@ describe('WebSocket Post Actions', () => {
                 metadata: isUrgent ? {priority: {priority: 'urgent'}} : undefined,
             });
             jest.spyOn(operator, 'batchRecords').mockImplementation(jest.fn());
-            jest.spyOn(operator, 'handlePosts').mockResolvedValue(postModels);
+            jest.spyOn(operator, 'handlePosts').mockResolvedValue({models: postModels, revokedFiles: []});
 
             const myChannelWithUrgentMentions = TestHelper.fakeMyChannelModel({
                 ...myChannelModel,
@@ -176,7 +190,7 @@ describe('WebSocket Post Actions', () => {
         it('should handle new post event - without channel membership present', async () => {
             const emitSpy = jest.spyOn(DeviceEventEmitter, 'emit');
             const batchRecordsSpy = jest.spyOn(operator, 'batchRecords').mockImplementation(jest.fn());
-            jest.spyOn(operator, 'handlePosts').mockResolvedValue(postModels);
+            jest.spyOn(operator, 'handlePosts').mockResolvedValue({models: postModels, revokedFiles: []});
 
             mockedGetMyChannel.mockResolvedValueOnce(undefined);
             mockedFetchMyChannel.mockResolvedValue({teamId: 'team1', memberships: [TestHelper.fakeChannelMember({user_id: 'user1', channel_id: 'channel1'})]});
@@ -194,13 +208,13 @@ describe('WebSocket Post Actions', () => {
                 now: expect.any(Number),
             });
 
-            expect(batchRecordsSpy).toHaveBeenCalledWith(postModels, 'handleNewPostEvent');
+            expect(batchRecordsSpy).toHaveBeenCalledWith(postModels, 'handleNewPostEvent', true);
         });
 
         it('should handle new post event - CRT enabled, manually unread', async () => {
             const emitSpy = jest.spyOn(DeviceEventEmitter, 'emit');
             const batchRecordsSpy = jest.spyOn(operator, 'batchRecords').mockImplementation(jest.fn());
-            jest.spyOn(operator, 'handlePosts').mockResolvedValue(postModels);
+            jest.spyOn(operator, 'handlePosts').mockResolvedValue({models: postModels, revokedFiles: []});
 
             mockedGetMyChannel.mockResolvedValue(TestHelper.fakeMyChannelModel({...myChannelModel, manuallyUnread: true}));
             mockedGetIsCRTEnabled.mockResolvedValue(true);
@@ -222,7 +236,7 @@ describe('WebSocket Post Actions', () => {
                 manuallyUnread: false,
                 mentionsCount: 0,
                 messageCount: 4,
-            }), postModels[0]], 'handleNewPostEvent');
+            }), postModels[0]], 'handleNewPostEvent', true);
         });
 
         it('should handle new post event - out of order ws, CRT on, root id', async () => {
@@ -230,7 +244,7 @@ describe('WebSocket Post Actions', () => {
             jest.spyOn(EphemeralStore, 'getLastPostWebsocketEvent').mockReturnValueOnce({deleted: true, post: newPost});
             const emitSpy = jest.spyOn(DeviceEventEmitter, 'emit');
             const batchRecordsSpy = jest.spyOn(operator, 'batchRecords');
-            jest.spyOn(operator, 'handlePosts').mockResolvedValue(postModels);
+            jest.spyOn(operator, 'handlePosts').mockResolvedValue({models: postModels, revokedFiles: []});
 
             mockedGetMyChannel.mockResolvedValue(myChannelModel);
             mockedGetIsCRTEnabled.mockResolvedValue(true);
@@ -251,7 +265,7 @@ describe('WebSocket Post Actions', () => {
         it('should handle new post event - from webhook and is tablet', async () => {
             const emitSpy = jest.spyOn(DeviceEventEmitter, 'emit');
             const batchRecordsSpy = jest.spyOn(operator, 'batchRecords').mockImplementation(jest.fn());
-            jest.spyOn(operator, 'handlePosts').mockResolvedValue(postModels);
+            jest.spyOn(operator, 'handlePosts').mockResolvedValue({models: postModels, revokedFiles: []});
 
             mockedGetMyChannel.mockResolvedValue(myChannelModel);
             mockedGetIsCRTEnabled.mockResolvedValue(false);
@@ -275,7 +289,22 @@ describe('WebSocket Post Actions', () => {
                 manuallyUnread: false,
                 mentionsCount: 0,
                 messageCount: 4,
-            }), postModels[0]], 'handleNewPostEvent');
+            }), postModels[0]], 'handleNewPostEvent', true);
+        });
+
+        it('should log and keep files when the commit fails', async () => {
+            const revokedFiles = [{id: 'file1', name: 'secret.png', extension: 'png', mime_type: 'image/png'}];
+            jest.spyOn(operator, 'batchRecords').mockRejectedValueOnce(new Error('write failed'));
+            jest.spyOn(operator, 'handlePosts').mockResolvedValue({models: postModels, revokedFiles});
+
+            mockedGetMyChannel.mockResolvedValue(myChannelModel);
+            mockedGetIsCRTEnabled.mockResolvedValue(false);
+            mockedShouldIgnorePost.mockReturnValue(false);
+
+            await handleNewPostEvent(serverUrl, msg);
+
+            expect(logError).toHaveBeenCalledWith('error on handleNewPostEvent', 'write failed');
+            expect(deleteDownloadedFiles).not.toHaveBeenCalled();
         });
 
         it('should handle new post event - no operator', async () => {
@@ -338,7 +367,39 @@ describe('WebSocket Post Actions', () => {
             expect(mockedSyncPermalinkPreviewsForEditedPost).toHaveBeenCalledWith(expect.any(Object), editedPost);
             expect(mockedGetPostById).toHaveBeenCalledWith(expect.any(Object), 'post1');
             expect(mockedFetchChannelStats).toHaveBeenCalledWith(serverUrl, 'channel1');
-            expect(batchRecordsSpy).toHaveBeenCalledWith([expect.any(PostsInChannelModel)], 'handlePostEdited');
+            expect(batchRecordsSpy).toHaveBeenCalledWith([expect.any(PostsInChannelModel)], 'handlePostEdited', true);
+        });
+
+        it('should stamp the epoch current when the edit arrived, not one raised while it was handled', async () => {
+            // The payload carries the decision the server made at broadcast; an invalidation flushed
+            // during the author fetch must not be stamped onto it.
+            let counter = 1;
+            const captureSpy = jest.spyOn(Redaction, 'captureRedactionEpoch').mockImplementation(async () => counter);
+            mockedFetchPostAuthors.mockImplementation(async () => {
+                counter = 2;
+                return {authors: []};
+            });
+            const handlePostsSpy = jest.spyOn(operator, 'handlePosts');
+            mockedGetPostById.mockResolvedValue(postModels[0]);
+
+            await handlePostEdited(serverUrl, msg);
+
+            expect(handlePostsSpy).toHaveBeenCalledWith(expect.objectContaining({redactionVerifiedEpoch: 1}));
+            captureSpy.mockRestore();
+            handlePostsSpy.mockRestore();
+        });
+
+        it('should not vouch for a burn-on-read edit, which the broadcast redaction does not cover', async () => {
+            const captureSpy = jest.spyOn(Redaction, 'captureRedactionEpoch').mockResolvedValue(5);
+            const handlePostsSpy = jest.spyOn(operator, 'handlePosts');
+            mockedGetPostById.mockResolvedValue(postModels[0]);
+
+            await handlePostEdited(serverUrl, {data: {post: JSON.stringify({...editedPost, type: PostTypes.BURN_ON_READ})}} as WebSocketMessage);
+
+            expect(captureSpy).not.toHaveBeenCalled();
+            expect(handlePostsSpy).toHaveBeenCalledWith(expect.objectContaining({redactionVerifiedEpoch: undefined}));
+            captureSpy.mockRestore();
+            handlePostsSpy.mockRestore();
         });
 
         it('should handle post edited event - post exists with permalink updates', async () => {
@@ -356,6 +417,7 @@ describe('WebSocket Post Actions', () => {
                     expect.any(PostsInChannelModel),
                 ]),
                 'handlePostEdited',
+                true,
             );
         });
 
@@ -399,7 +461,51 @@ describe('WebSocket Post Actions', () => {
             await handlePostEdited(serverUrl, msg);
 
             expect(logWarningSpy).toHaveBeenCalledWith('Failed to sync permalink previews for edited post:', expect.any(Error));
-            expect(batchRecordsSpy).toHaveBeenCalledWith([expect.any(PostsInChannelModel)], 'handlePostEdited');
+            expect(batchRecordsSpy).toHaveBeenCalledWith([expect.any(PostsInChannelModel)], 'handlePostEdited', true);
+        });
+
+        it('should leave streaming state to the stream-end refetch for conversation-backed agent posts', async () => {
+            const agentPost = {...editedPost, type: AGENT_POST_TYPES.LLMBOT, props: {conversation_id: 'conv1'}};
+            const removePostSpy = jest.spyOn(streamingStore, 'removePost');
+            mockedGetPostById.mockResolvedValue(postModels[0]);
+
+            await handlePostEdited(serverUrl, {data: {post: JSON.stringify(agentPost)}} as WebSocketMessage);
+
+            expect(removePostSpy).not.toHaveBeenCalled();
+            expect(settleStreamedPost).not.toHaveBeenCalled();
+        });
+
+        it('should settle a conversation-backed agent post whose stream ended before the edit was stored', async () => {
+            const agentPost = {...editedPost, type: AGENT_POST_TYPES.LLMBOT, props: {conversation_id: 'conv1'}};
+            streamingStore.startStreaming(serverUrl, agentPost.id);
+            streamingStore.endStreaming(serverUrl, agentPost.id);
+            mockedGetPostById.mockResolvedValue(postModels[0]);
+
+            await handlePostEdited(serverUrl, {data: {post: JSON.stringify(agentPost)}} as WebSocketMessage);
+
+            expect(settleStreamedPost).toHaveBeenCalledWith(serverUrl, agentPost.id);
+            streamingStore.removeServer(serverUrl);
+        });
+
+        it('should not settle a conversation-backed agent post that is still streaming', async () => {
+            const agentPost = {...editedPost, type: AGENT_POST_TYPES.LLMBOT, props: {conversation_id: 'conv1'}};
+            streamingStore.startStreaming(serverUrl, agentPost.id);
+            mockedGetPostById.mockResolvedValue(postModels[0]);
+
+            await handlePostEdited(serverUrl, {data: {post: JSON.stringify(agentPost)}} as WebSocketMessage);
+
+            expect(settleStreamedPost).not.toHaveBeenCalled();
+            streamingStore.removeServer(serverUrl);
+        });
+
+        it('should clear streaming state for legacy agent posts without a conversation', async () => {
+            const agentPost = {...editedPost, type: AGENT_POST_TYPES.LLMBOT, props: {}};
+            const removePostSpy = jest.spyOn(streamingStore, 'removePost');
+            mockedGetPostById.mockResolvedValue(postModels[0]);
+
+            await handlePostEdited(serverUrl, {data: {post: JSON.stringify(agentPost)}} as WebSocketMessage);
+
+            expect(removePostSpy).toHaveBeenCalledWith(serverUrl, 'post1');
         });
 
         it('should handle post edited event - no operator', async () => {
@@ -456,6 +562,7 @@ describe('WebSocket Post Actions', () => {
                     }),
                 ]),
                 'handlePostEdited',
+                true,
             );
         });
 
@@ -475,6 +582,7 @@ describe('WebSocket Post Actions', () => {
                     expect.any(PostsInChannelModel),
                 ]),
                 'handlePostEdited',
+                true,
             );
 
             expect(batchRecordsSpy).not.toHaveBeenCalledWith(
@@ -500,6 +608,7 @@ describe('WebSocket Post Actions', () => {
             expect(batchRecordsSpy).not.toHaveBeenCalledWith(
                 expect.anything(),
                 'handlePostEdited',
+                true,
             );
         });
     });

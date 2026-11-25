@@ -1,21 +1,28 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+import {waitFor} from '@testing-library/react-native';
 import {firstValueFrom} from 'rxjs';
 
 import {setAccessControlGroupId} from '@actions/local/channel_attributes';
-import {CLASSIFICATIONS_SYSTEM_VALUE_TARGET_ID} from '@constants/classification';
+import {License} from '@constants';
+import {FEATURE_FLAG_CHANNEL_ATTRIBUTES, FEATURE_FLAG_CHANNEL_ATTRIBUTES_REQUIRED} from '@constants/channel_attributes';
+import {CLASSIFICATIONS_SYSTEM_VALUE_TARGET_ID, FEATURE_FLAG_CLASSIFICATION_MARKINGS} from '@constants/classification';
+import {SYSTEM_IDENTIFIERS} from '@constants/database';
 import DatabaseManager from '@database/manager';
 
 import {
     observeChannelAttributeBanner,
     observeChannelAttributeFields,
+    observeChannelAttributesRequiredEnabled,
     observeClassificationBannerState,
+    observeClassificationMarkingsEnabled,
     observeResolvedChannelAttributes,
 } from './properties';
 
 import type ServerDataOperator from '@database/operator/server_data_operator';
 import type {Database} from '@nozbe/watermelondb';
+import type {ResolvedChannelAttribute} from '@utils/channel_attributes';
 
 const serverUrl = 'properties.query.test.com';
 const groupId = 'access_control';
@@ -95,6 +102,14 @@ describe('observeClassificationBannerState', () => {
         const state = await firstValueFrom(observeClassificationBannerState(database));
         expect(state).toEqual({visible: false, levelName: '', color: ''});
     });
+
+    it('should ignore fields and values from another property group', async () => {
+        await seedFields([makeField({group_id: 'other-group'})]);
+        await seedValues([makeValue({group_id: 'other-group'})]);
+
+        const state = await firstValueFrom(observeClassificationBannerState(database));
+        expect(state).toEqual({visible: false, levelName: '', color: ''});
+    });
 });
 
 describe('observeChannelAttributeFields', () => {
@@ -148,9 +163,52 @@ describe('observeResolvedChannelAttributes', () => {
         ]);
     });
 
+    it('should re-emit when an option of a multi-valued attribute changes color', async () => {
+        const options = [{id: 'noforn', name: 'NOFORN', color: '#FF0000'}, {id: 'orcon', name: 'ORCON', color: '#00FF00'}];
+        await seedFields([makeField({id: 'cf-1', name: 'dissemination', type: 'multiselect', object_type: 'channel', attrs: {options}})]);
+        await operator.handlePropertyValues({
+            values: [{...makeValue({id: 'cv-1', target_id: channelId, target_type: 'channel', field_id: 'cf-1'}), value: ['noforn', 'orcon']}],
+            prepareRecordsOnly: false,
+        });
+
+        const emissions: string[][] = [];
+        const subscription = observeResolvedChannelAttributes(database, channelId).subscribe((resolved) => {
+            emissions.push(resolved[0].displayValues.map((entry) => entry.color ?? ''));
+        });
+
+        await seedFields([makeField({
+            id: 'cf-1',
+            name: 'dissemination',
+            type: 'multiselect',
+            object_type: 'channel',
+            update_at: 2000,
+            attrs: {options: [options[0], {...options[1], color: '#0000FF'}]},
+        })]);
+        await waitFor(() => expect(emissions).toHaveLength(2));
+        subscription.unsubscribe();
+
+        expect(emissions[1]).toEqual(['#FF0000', '#0000FF']);
+    });
+
     it('should not leak another channel value into this channel', async () => {
         await seedFields([makeField({id: 'cf-1', name: 'classification', object_type: 'channel', attrs: {options: [{id: 'level-secret', name: 'Secret'}]}})]);
         await seedValues([makeValue({id: 'cv-1', target_id: 'another-channel', target_type: 'channel', field_id: 'cf-1', value: 'level-secret'})]);
+
+        const resolved = await firstValueFrom(observeResolvedChannelAttributes(database, channelId));
+        expect(resolved).toHaveLength(1);
+        expect(resolved[0].displayValue).toBe('');
+    });
+
+    it('should ignore a value for the same target from another property group', async () => {
+        await seedFields([makeField({id: 'cf-1', name: 'classification', object_type: 'channel', attrs: {options: [{id: 'level-secret', name: 'Secret'}]}})]);
+        await seedValues([makeValue({
+            id: 'cv-1',
+            group_id: 'other-group',
+            target_id: channelId,
+            target_type: 'channel',
+            field_id: 'cf-1',
+            value: 'level-secret',
+        })]);
 
         const resolved = await firstValueFrom(observeResolvedChannelAttributes(database, channelId));
         expect(resolved).toHaveLength(1);
@@ -187,5 +245,181 @@ describe('observeChannelAttributeBanner', () => {
 
         const state = await firstValueFrom(observeChannelAttributeBanner(database, channelId));
         expect(state.hasBanner).toBe(false);
+    });
+});
+
+describe('observeResolvedChannelAttributes re-emission', () => {
+    const channelId = 'channel-123';
+
+    const channelField = (attrs: PropertyFieldAttrs, overrides?: Partial<PropertyField>) => makeField({
+        id: 'cf-1',
+        name: 'classification',
+        object_type: 'channel',
+        type: 'rank',
+        attrs,
+        ...overrides,
+    });
+
+    const options = [
+        {id: 'level-public', name: 'Public', color: '#00FF00', rank: 1},
+        {id: 'level-secret', name: 'Secret', color: '#FF0000', rank: 2},
+    ];
+
+    // Records every emission, so a change the comparator swallows shows up as a missing one.
+    const emissionsWhile = async (mutate: () => Promise<void>) => {
+        const emissions: ResolvedChannelAttribute[][] = [];
+        const subscription = observeResolvedChannelAttributes(database, channelId).subscribe((resolved) => {
+            emissions.push(resolved);
+        });
+
+        await mutate();
+
+        // WatermelonDB delivers a column change on a later tick, so unsubscribing
+        // straight after the write would miss the emission being asserted on.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        subscription.unsubscribe();
+        return emissions;
+    };
+
+    it('should re-emit when a change policy is narrowed, even though the rendered value is identical', async () => {
+        await seedFields([channelField({options, change_policy: 'any'})]);
+        await seedValues([makeValue({id: 'cv-1', target_id: channelId, target_type: 'channel', field_id: 'cf-1', value: 'level-secret'})]);
+
+        const emissions = await emissionsWhile(async () => {
+            await seedFields([channelField({options, change_policy: 'raise_only'})]);
+        });
+
+        expect(emissions.length).toBeGreaterThan(1);
+        const last = emissions[emissions.length - 1];
+        expect(last[0].displayValue).toBe('Secret');
+        expect(last[0].field.attrs?.change_policy).toBe('raise_only');
+    });
+
+    it('should re-emit when the permission tier is revoked', async () => {
+        await seedFields([channelField({options}, {permission_values: 'member'})]);
+        await seedValues([makeValue({id: 'cv-1', target_id: channelId, target_type: 'channel', field_id: 'cf-1', value: 'level-secret'})]);
+
+        const emissions = await emissionsWhile(async () => {
+            await seedFields([channelField({options}, {permission_values: 'none'})]);
+        });
+
+        expect(emissions.length).toBeGreaterThan(1);
+        expect(emissions[emissions.length - 1][0].field.permissionValues).toBe('none');
+    });
+
+    it('should re-emit when an option is removed from the field', async () => {
+        await seedFields([channelField({options})]);
+        await seedValues([makeValue({id: 'cv-1', target_id: channelId, target_type: 'channel', field_id: 'cf-1', value: 'level-secret'})]);
+
+        const emissions = await emissionsWhile(async () => {
+            await seedFields([channelField({options: [options[1]]})]);
+        });
+
+        expect(emissions.length).toBeGreaterThan(1);
+        expect(emissions[emissions.length - 1][0].field.attrs?.options).toHaveLength(1);
+    });
+
+    it('should re-emit when an option rename collides under naive \':\'/\',\' joining but is a real change', async () => {
+        // Renaming the remaining option to "x,b:2:blue:y" yields the same string a naive
+        // ':'/','-joined signature gives for options a and b, so it would see no change.
+        await seedFields([channelField({options: [
+            {id: 'a', name: 'x', color: 'red', rank: 1},
+            {id: 'b', name: 'y', color: 'blue', rank: 2},
+        ]})]);
+        await seedValues([makeValue({id: 'cv-1', target_id: channelId, target_type: 'channel', field_id: 'cf-1', value: 'a'})]);
+
+        const emissions = await emissionsWhile(async () => {
+            await seedFields([channelField({options: [
+                {id: 'a', name: 'x,b:2:blue:y', color: 'red', rank: 1},
+            ]})]);
+        });
+
+        expect(emissions.length).toBeGreaterThan(1);
+        expect(emissions[emissions.length - 1][0].field.attrs?.options).toHaveLength(1);
+    });
+
+    it('should re-emit when the stored option id changes to another with the same rendered name and colour', async () => {
+        // Both options render the same; only rawValue in the signature catches the switch.
+        await seedFields([channelField({options: [
+            {id: 'a', name: 'Dup', color: '#123456', rank: 1},
+            {id: 'b', name: 'Dup', color: '#123456', rank: 2},
+        ]})]);
+        await seedValues([makeValue({id: 'cv-1', target_id: channelId, target_type: 'channel', field_id: 'cf-1', value: 'a'})]);
+
+        const emissions = await emissionsWhile(async () => {
+            await seedValues([makeValue({id: 'cv-1', target_id: channelId, target_type: 'channel', field_id: 'cf-1', value: 'b'})]);
+        });
+
+        expect(emissions.length).toBeGreaterThan(1);
+        expect(emissions[emissions.length - 1][0].rawValue).toBe('b');
+    });
+
+    it('should not re-emit when nothing the surfaces read has changed', async () => {
+        await seedFields([channelField({options})]);
+        await seedValues([makeValue({id: 'cv-1', target_id: channelId, target_type: 'channel', field_id: 'cf-1', value: 'level-secret'})]);
+
+        const emissions = await emissionsWhile(async () => {
+            await seedFields([channelField({options}, {update_at: 5000})]);
+        });
+
+        expect(emissions).toHaveLength(1);
+    });
+});
+
+describe('feature flag observables', () => {
+    const seedConfig = (configs: Array<{id: string; value: string}>) => operator.handleConfigs({
+        configs,
+        configsToDelete: [],
+        prepareRecordsOnly: false,
+    });
+
+    const emissionsWhile = async (observable: ReturnType<typeof observeClassificationMarkingsEnabled>, mutate: () => Promise<unknown>) => {
+        const emissions: boolean[] = [];
+        const subscription = observable.subscribe((value) => emissions.push(value));
+        await mutate();
+        await waitFor(() => expect(emissions.length).toBeGreaterThan(1));
+        subscription.unsubscribe();
+        return emissions;
+    };
+
+    describe('observeChannelAttributesRequiredEnabled', () => {
+        beforeEach(async () => {
+            await operator.handleSystem({
+                systems: [{id: SYSTEM_IDENTIFIERS.LICENSE, value: {IsLicensed: 'true', SkuShortName: License.SKU_SHORT_NAME.EnterpriseAdvanced}}],
+                prepareRecordsOnly: false,
+            });
+            await seedConfig([
+                {id: 'BuildEnterpriseReady', value: 'true'},
+                {id: FEATURE_FLAG_CHANNEL_ATTRIBUTES, value: 'true'},
+                {id: FEATURE_FLAG_CHANNEL_ATTRIBUTES_REQUIRED, value: 'false'},
+            ]);
+        });
+
+        it('should follow the required flag as it is turned on and off', async () => {
+            const observable = observeChannelAttributesRequiredEnabled(database);
+
+            expect(await emissionsWhile(observable, () => seedConfig([{id: FEATURE_FLAG_CHANNEL_ATTRIBUTES_REQUIRED, value: 'true'}]))).toEqual([false, true]);
+            expect(await emissionsWhile(observable, () => seedConfig([{id: FEATURE_FLAG_CHANNEL_ATTRIBUTES_REQUIRED, value: 'false'}]))).toEqual([true, false]);
+        });
+
+        it('should be off when channel attributes are off, whatever the required flag says', async () => {
+            await seedConfig([
+                {id: FEATURE_FLAG_CHANNEL_ATTRIBUTES, value: 'false'},
+                {id: FEATURE_FLAG_CHANNEL_ATTRIBUTES_REQUIRED, value: 'true'},
+            ]);
+
+            expect(await firstValueFrom(observeChannelAttributesRequiredEnabled(database))).toBe(false);
+        });
+    });
+
+    describe('observeClassificationMarkingsEnabled', () => {
+        it('should follow the classification markings flag', async () => {
+            await seedConfig([{id: FEATURE_FLAG_CLASSIFICATION_MARKINGS, value: 'false'}]);
+
+            const emissions = await emissionsWhile(observeClassificationMarkingsEnabled(database), () => seedConfig([{id: FEATURE_FLAG_CLASSIFICATION_MARKINGS, value: 'true'}]));
+
+            expect(emissions).toEqual([false, true]);
+        });
     });
 });

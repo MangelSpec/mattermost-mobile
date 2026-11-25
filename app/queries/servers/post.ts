@@ -141,6 +141,15 @@ export const queryPostReplies = (database: Database, rootId: string, excludeDele
     return database.get<PostModel>(POST).query(...clauses);
 };
 
+export const queryNewestThreadReplies = (database: Database, rootId: string, limit: number) => {
+    return database.get<PostModel>(POST).query(
+        Q.where('root_id', rootId),
+        Q.where('delete_at', Q.eq(0)),
+        Q.sortBy('create_at', Q.desc),
+        Q.take(limit),
+    );
+};
+
 export const getRecentPostsInThread = async (database: Database, rootId: string) => {
     const chunks = await queryPostsInThread(database, rootId, true, true).fetch();
     if (chunks.length) {
@@ -201,7 +210,22 @@ export const getRecentPostsInChannel = async (database: Database, channelId: str
     return [];
 };
 
-export const queryPostsById = (database: Database, postIds: string[], sort?: Q.SortOrder) => {
+/**
+ * The server-known post immediately newer than `createAt` in a channel, so that "posts before it"
+ * starts at the post at `createAt`. Pending posts are skipped: the server does not know their ids.
+ */
+export const getNewerPostInChannel = async (database: Database, channelId: string, createAt: number) => {
+    const posts = await database.get<PostModel>(POST).query(
+        Q.where('channel_id', channelId),
+        Q.where('create_at', Q.gt(createAt)),
+        Q.where('delete_at', Q.eq(0)),
+        Q.sortBy('create_at', Q.asc),
+        Q.take(5),
+    ).fetch();
+    return posts.find((p) => p.pendingPostId !== p.id);
+};
+
+export const queryPostsById =(database: Database, postIds: string[], sort?: Q.SortOrder) => {
     const clauses: Q.Clause[] = [Q.where('id', Q.oneOf(postIds))];
     if (sort) {
         clauses.push(Q.sortBy('create_at', sort));

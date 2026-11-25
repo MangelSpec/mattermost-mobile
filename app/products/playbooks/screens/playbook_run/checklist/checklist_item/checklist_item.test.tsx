@@ -10,6 +10,7 @@ import UserChip from '@components/chips/user_chip';
 import {General, Preferences, Screens} from '@constants';
 import {useServerUrl} from '@context/server';
 import {runChecklistItem, skipChecklistItem, updateChecklistItem} from '@playbooks/actions/remote/checklist';
+import {goToFillRequirements} from '@playbooks/screens/navigation';
 import {bottomSheet, dismissAllRoutesAndPopToScreen} from '@screens/navigation';
 import {renderWithIntl} from '@test/intl-test-helper';
 import TestHelper from '@test/test_helper';
@@ -38,6 +39,9 @@ jest.mocked(ChecklistItemBottomSheet).mockImplementation((props: ComponentProps<
 
 jest.mock('@calls/actions');
 jest.mock('@playbooks/actions/remote/checklist');
+jest.mock('@playbooks/screens/navigation', () => ({
+    goToFillRequirements: jest.fn(),
+}));
 jest.mock('@utils/snack_bar');
 jest.mock('@screens/navigation');
 jest.mock('@utils/navigation');
@@ -58,8 +62,11 @@ describe('ChecklistItem', () => {
     function getBaseProps(): ComponentProps<typeof ChecklistItem> {
         return {
             item: mockItem,
+            timelineEvents: [],
             assignee: mockAssignee,
             teammateNameDisplay: 'username',
+            timezone: '',
+            isMilitaryTime: false,
             channelId: 'channel-id-1',
             checklistNumber: 0,
             itemNumber: 0,
@@ -67,6 +74,7 @@ describe('ChecklistItem', () => {
             isDisabled: false,
             currentUserId: 'user-id-1',
             channelType: General.OPEN_CHANNEL,
+            taskRequirementsEnabled: false,
         };
     }
 
@@ -161,6 +169,34 @@ describe('ChecklistItem', () => {
         await waitFor(() => {
             expect(updateChecklistItem).toHaveBeenCalledWith(serverUrl, props.playbookRunId, props.item.id, props.checklistNumber, props.itemNumber, '');
         });
+    });
+
+    it('should open fill requirements instead of closing when requirements exist', async () => {
+        const props = getBaseProps();
+        props.taskRequirementsEnabled = true;
+        props.item.requirements = [{id: 'req-1', label: 'Ticket URL', value: ''}];
+        props.item.state = '';
+
+        const {getByTestId} = renderWithIntl(<ChecklistItem {...props}/>);
+        const checkbox = getByTestId('checkbox-component');
+
+        act(() => {
+            checkbox.props.onPress();
+        });
+
+        await waitFor(() => {
+            expect(goToFillRequirements).toHaveBeenCalledWith({
+                playbookRunId: props.playbookRunId,
+                itemId: props.item.id,
+                checklistNumber: props.checklistNumber,
+                itemNumber: props.itemNumber,
+                taskTitle: props.item.title,
+                requirements: props.item.requirements,
+                currentState: '',
+                editMode: false,
+            });
+        });
+        expect(updateChecklistItem).not.toHaveBeenCalled();
     });
 
     it('shows snackbar when checklist item fails to toggle', async () => {
@@ -429,6 +465,37 @@ describe('ChecklistItem', () => {
         await waitFor(() => {
             expect(runChecklistItem).toHaveBeenCalledWith(serverUrl, props.playbookRunId, props.checklistNumber, props.itemNumber);
         });
+    });
+
+    it('should render task activity and include its detail row in the bottom-sheet height', () => {
+        const props = getBaseProps();
+        props.activity = {action: 'check', actorUserId: mockAssignee.id, timestamp: Date.now()};
+        props.activityActor = mockAssignee;
+        props.timelineEvents = [{
+            id: 'event-1',
+            playbook_run_id: props.playbookRunId,
+            create_at: 1000,
+            event_at: 1000,
+            event_type: 'task_state_modified',
+            summary: '',
+            details: '{"action":"check"}',
+            post_id: '',
+            subject_user_id: mockAssignee.id,
+            creator_user_id: mockAssignee.id,
+        }];
+
+        const {getByTestId, getByText} = renderWithIntl(<ChecklistItem {...props}/>);
+        expect(getByTestId('playbook_run.checklist_item.task_activity')).toBeVisible();
+
+        fireEvent.press(getByText('Test Item'));
+        const args = jest.mocked(bottomSheet).mock.calls[0] as Parameters<typeof bottomSheet>;
+        expect(args[1]).toEqual([1, 455, '80%']);
+
+        const BottomSheetComponent = args[0];
+        const {getByTestId: getByTestIdInSheet} = renderWithIntl(<BottomSheetComponent/>);
+        const bottomSheetComponent = getByTestIdInSheet('checklist-item-bottom-sheet-component');
+        expect(bottomSheetComponent.props.timelineEvents).toBe(props.timelineEvents);
+        expect(bottomSheetComponent.props.activity).toBeUndefined();
     });
 
     describe('condition icon', () => {

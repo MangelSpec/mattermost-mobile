@@ -48,6 +48,7 @@ export const transformPlaybookRunRecord = ({action, database, value}: Transforme
         run.activeStage = raw.active_stage ?? record?.activeStage ?? 0;
         run.activeStageTitle = raw.active_stage_title ?? record?.activeStageTitle ?? '';
         run.participantIds = raw.participant_ids ?? record?.participantIds ?? [];
+        run.timelineEvents = raw.timeline_events === undefined ? record?.timelineEvents ?? [] : raw.timeline_events ?? [];
         run.summary = raw.summary ?? record?.summary ?? '';
         run.currentStatus = raw.current_status ?? record?.currentStatus ?? 'InProgress';
         run.lastStatusUpdateAt = raw.last_status_update_at ?? record?.lastStatusUpdateAt ?? 0;
@@ -131,6 +132,7 @@ export const transformPlaybookChecklistItemRecord = ({action, database, value}: 
         item.dueDate = raw.due_date ?? record?.dueDate ?? 0;
         item.completedAt = raw.completed_at ?? record?.completedAt ?? 0;
         item.taskActions = raw.task_actions ?? record?.taskActions ?? [];
+        item.requirements = raw.requirements ?? record?.requirements ?? [];
         item.conditionAction = raw.condition_action ?? record?.conditionAction ?? '';
         item.conditionReason = raw.condition_reason ?? record?.conditionReason ?? '';
         item.updateAt = raw.update_at ?? record?.updateAt ?? 0;

@@ -4,6 +4,8 @@
 import {
     DISPLAY_BANNER_BOTTOM,
     DISPLAY_BANNER_TOP,
+    OPTION_BACKED_FIELD_TYPES,
+    SIGNATURE_SEPARATOR,
 } from '@constants/channel_attributes';
 import {CLASSIFICATIONS_FIELD_NAME} from '@constants/classification';
 
@@ -13,7 +15,7 @@ import type {PropertyFieldModel, PropertyValueModel} from '@database/models/serv
 // payloads satisfy, so the same pure helpers serve the observers and the tests.
 // Selection by group, object_type and delete_at happens in the scoped queries in
 // @queries/servers/properties; these helpers only project what was selected.
-export type ChannelAttributeField = Pick<PropertyFieldModel, 'id' | 'name' | 'type' | 'attrs'>;
+export type ChannelAttributeField = Pick<PropertyFieldModel, 'id' | 'name' | 'type' | 'attrs' | 'permissionValues'>;
 export type ChannelAttributeValue = Pick<PropertyValueModel, 'fieldId' | 'value'>;
 
 export type ResolvedChannelAttribute = {
@@ -26,29 +28,62 @@ export type ResolvedChannelAttribute = {
     // a stored option id that no longer exists on the field.
     option?: PropertyFieldOption;
 
-    // Display string, empty when the attribute is unset.
+    // Display string, empty when the attribute is unset. For a multi-valued
+    // attribute this is every value joined, kept for surfaces that render plain
+    // text (the banner).
     displayValue: string;
+
+    // One entry per underlying value, in order, each with its own resolved
+    // color when the field is options-bearing. A single-valued attribute has
+    // one entry; an unset attribute has none. Chip-rendering surfaces should
+    // render one chip per entry instead of collapsing to displayValue, so a
+    // multiselect or graph attribute shows each value as its own chip.
+    displayValues: Array<{value: string; color?: string}>;
 
     // Option ids that no longer resolve on an options-bearing field.
     unresolvedOptionIds?: string[];
 };
 
+// Shown to the user, not hidden: a row that ignores taps reads as broken.
+export type AttributeLockReason = 'never' | 'raise_only' | 'lower_only' | 'permission' | 'unsupported_type';
+
+export type AttributeEditability =
+    | {editable: true}
+    | {editable: false; reason: AttributeLockReason};
+
+// What a field's permission_values tier requires beyond the channel-level gate.
+export type AttributeTierGate = 'never' | 'channel_only' | 'manage_channel_roles' | 'manage_system';
+
+export type ChannelAttributePermissions = {
+    canManageChannelProperties: boolean;
+    canManageChannelRoles: boolean;
+    canManageSystem: boolean;
+};
+
 export type ChannelAttributeBannerState = {
     hasBanner: boolean;
     banner: ChannelBannerInfo | undefined;
+
+    // The channel's own banner_info text with its template resolved, for when
+    // no designated attribute produces a banner and the native one shows.
+    nativeText?: string;
 };
 
 const NO_BANNER: ChannelAttributeBannerState = {hasBanner: false, banner: undefined};
 
 const EMPTY_RESOLVED: ResolvedChannelAttribute[] = [];
 
+const EMPTY_OPTIONS: PropertyFieldOption[] = [];
+
+const EDITABLE: AttributeEditability = {editable: true};
+
+const EDITABLE_FIELD_TYPES = new Set<string>(['text', 'select', 'multiselect', 'rank']);
+
 // Ranks a field for display. Absent sort_order sorts last rather than first, so
 // an unconfigured field never jumps ahead of a configured one.
 const NO_SORT_ORDER = Number.MAX_SAFE_INTEGER;
 
 const DEFAULT_BANNER_COLOR = '#DDDDDD';
-
-const OPTION_BACKED_TYPES = new Set<PropertyFieldType>(['select', 'multiselect', 'rank']);
 
 function getFieldOptions(field: ChannelAttributeField): PropertyFieldOption[] {
     return field.attrs?.options ?? [];
@@ -63,6 +98,59 @@ export function isPropertyValueSet(raw: unknown): boolean {
         return false;
     }
     return !(Array.isArray(raw) && raw.length === 0);
+}
+
+/**
+ * Never null: the iOS bridge drops null-valued keys, so the server gets an item
+ * with no value and rejects it. The server reads "" and [] as unset.
+ */
+export function getEmptyPropertyValue(fieldType: string): string | string[] {
+    return fieldType === 'multiselect' || fieldType === 'multiuser' ? [] : '';
+}
+
+/**
+ * Drops create-form draft values whose field or option was removed after it was
+ * picked, so Create does not send ids the server rejects. Returns the same object
+ * when nothing changed.
+ */
+export function pruneStaleAttributeValues(
+    fields: ChannelAttributeField[],
+    values: Record<string, string | string[]>,
+): Record<string, string | string[]> {
+    const fieldById = new Map(fields.map((field) => [field.id, field]));
+    let changed = false;
+    const next: Record<string, string | string[]> = {};
+
+    for (const [fieldId, value] of Object.entries(values)) {
+        const field = fieldById.get(fieldId);
+        if (!field || !OPTION_BACKED_FIELD_TYPES.has(field.type)) {
+            if (field) {
+                next[fieldId] = value;
+            } else {
+                changed = true;
+            }
+            continue;
+        }
+
+        const validIds = new Set(getFieldOptions(field).map((option) => option.id));
+        let kept: string | string[] | undefined;
+        if (Array.isArray(value)) {
+            kept = value.filter((id) => validIds.has(id));
+        } else if (validIds.has(value)) {
+            kept = value;
+        }
+
+        if (kept === undefined || (Array.isArray(kept) && kept.length === 0)) {
+            changed = true;
+            continue;
+        }
+        if (Array.isArray(kept) && kept.length !== value.length) {
+            changed = true;
+        }
+        next[fieldId] = kept;
+    }
+
+    return changed ? next : values;
 }
 
 /**
@@ -150,6 +238,178 @@ export function canMoveToOption(field: ChannelAttributeField, currentValue: unkn
     return policy === 'raise_only' ? nextRank > currentRank : nextRank < currentRank;
 }
 
+export function reachableOptions(field: ChannelAttributeField, currentValue: unknown): PropertyFieldOption[] {
+    const options = getFieldOptions(field);
+    if (options.length === 0) {
+        return EMPTY_OPTIONS;
+    }
+
+    const reachable = options.filter((option) => canMoveToOption(field, currentValue, option.id));
+    return reachable.length === options.length ? options : reachable;
+}
+
+export function hasAttributeEditor(field: ChannelAttributeField): boolean {
+    return EDITABLE_FIELD_TYPES.has(field.type);
+}
+
+/**
+ * An absent or unrecognised tier reads as `never`, matching the server, which
+ * refuses a nil tier.
+ */
+export function attributeTierGate(field: ChannelAttributeField): AttributeTierGate {
+    switch (field.permissionValues) {
+        case 'sysadmin':
+            return 'manage_system';
+        case 'admin':
+            return 'manage_channel_roles';
+        case 'member':
+            return 'channel_only';
+        default:
+            return 'never';
+    }
+}
+
+/**
+ * Mirrors the server's canSetChannelAttributeOnCreate. The creator becomes a
+ * channel admin, so only `sysadmin` needs more; an unknown tier fails closed.
+ */
+export function canSetChannelAttributeOnCreate(field: ChannelAttributeField, canManageSystem: boolean): boolean {
+    switch (field.permissionValues) {
+        case 'member':
+        case 'admin':
+            return true;
+        case 'sysadmin':
+            return canManageSystem;
+        default:
+            return false;
+    }
+}
+
+export type ChannelAttributeCreateFlags = {
+    requiredEnforced: boolean;
+    classificationAvailable: boolean;
+};
+
+function isClassificationField(field: ChannelAttributeField): boolean {
+    return field.name === CLASSIFICATIONS_FIELD_NAME;
+}
+
+// The server refuses a classification value while its feature flag is off.
+function isFieldAvailableOnCreate(field: ChannelAttributeField, classificationAvailable: boolean): boolean {
+    return classificationAvailable || !isClassificationField(field);
+}
+
+function isOfferableOnCreate(field: ChannelAttributeField, canManageSystem: boolean): boolean {
+    return hasAttributeEditor(field) && canSetChannelAttributeOnCreate(field, canManageSystem);
+}
+
+// A plain copy, never the WatermelonDB model with its attrs changed in place.
+function asOptionalField(field: ChannelAttributeField): ChannelAttributeField {
+    return {
+        id: field.id,
+        name: field.name,
+        type: field.type,
+        permissionValues: field.permissionValues,
+        attrs: {...field.attrs, required: false},
+    };
+}
+
+/**
+ * With the required flag off the server enforces nothing, so only classification
+ * is offered, as optional.
+ */
+export function getCreatableChannelAttributeFields(
+    fields: ChannelAttributeField[],
+    canManageSystem: boolean,
+    {requiredEnforced, classificationAvailable}: ChannelAttributeCreateFlags,
+): ChannelAttributeField[] {
+    const available = fields.filter((field) => isFieldAvailableOnCreate(field, classificationAvailable) && isOfferableOnCreate(field, canManageSystem));
+
+    if (!requiredEnforced) {
+        return available.filter(isClassificationField).map(asOptionalField);
+    }
+
+    return available.
+        filter(isPropertyFieldRequired).
+        sort(compareChannelAttributeFields);
+}
+
+/**
+ * A required field the caller may set but mobile has no editor for. Unlike a
+ * sysadmin-only field, the server still requires it, so creation would fail with a 400.
+ */
+export function hasCreationBlockingChannelAttribute(
+    fields: ChannelAttributeField[],
+    canManageSystem: boolean,
+    {requiredEnforced, classificationAvailable}: ChannelAttributeCreateFlags,
+): boolean {
+    if (!requiredEnforced) {
+        return false;
+    }
+
+    return fields.some((field) => isPropertyFieldRequired(field) &&
+        isFieldAvailableOnCreate(field, classificationAvailable) &&
+        !hasAttributeEditor(field) &&
+        canSetChannelAttributeOnCreate(field, canManageSystem));
+}
+
+export function channelAttributePermissionsEqual(a: ChannelAttributePermissions, b: ChannelAttributePermissions): boolean {
+    return a.canManageChannelProperties === b.canManageChannelProperties &&
+        a.canManageChannelRoles === b.canManageChannelRoles &&
+        a.canManageSystem === b.canManageSystem;
+}
+
+export function canEditAttributeField(field: ChannelAttributeField, permissions: ChannelAttributePermissions): boolean {
+    if (!permissions.canManageChannelProperties) {
+        return false;
+    }
+
+    switch (attributeTierGate(field)) {
+        case 'channel_only':
+            return true;
+        case 'manage_channel_roles':
+            return permissions.canManageChannelRoles;
+        case 'manage_system':
+            return permissions.canManageSystem;
+        default:
+            return false;
+    }
+}
+
+/**
+ * Reads the stored value, so an option id that no longer resolves still counts as
+ * set. A policy only locks a set value; the server exempts the first write.
+ */
+export function getAttributeEditability(
+    field: ChannelAttributeField,
+    currentValue: unknown,
+    hasPermission: boolean,
+): AttributeEditability {
+    if (!hasAttributeEditor(field)) {
+        return {editable: false, reason: 'unsupported_type'};
+    }
+
+    // Policy before permission: the lock reason explains the row, not the viewer.
+    if (isPropertyValueSet(currentValue)) {
+        const policy = getPropertyFieldChangePolicy(field);
+
+        if (policy === 'never') {
+            return {editable: false, reason: 'never'};
+        }
+
+        // No reachable option means the server would refuse every change.
+        if (policy !== 'any' && reachableOptions(field, currentValue).length === 0) {
+            return {editable: false, reason: policy};
+        }
+    }
+
+    if (!hasPermission) {
+        return {editable: false, reason: 'permission'};
+    }
+
+    return EDITABLE;
+}
+
 /**
  * Orders fields for display: attrs.sort_order ascending, ties broken by name.
  *
@@ -169,36 +429,38 @@ export function compareChannelAttributeFields(a: ChannelAttributeField, b: Chann
     return a.name.localeCompare(b.name, 'en');
 }
 
-function resolveDisplayValue(field: ChannelAttributeField, raw: unknown): Pick<ResolvedChannelAttribute, 'option' | 'displayValue' | 'unresolvedOptionIds'> {
+function resolveDisplayValue(field: ChannelAttributeField, raw: unknown): Pick<ResolvedChannelAttribute, 'option' | 'displayValue' | 'displayValues' | 'unresolvedOptionIds'> {
     if (!isPropertyValueSet(raw)) {
-        return {displayValue: ''};
+        return {displayValue: '', displayValues: []};
     }
 
     const options = getFieldOptions(field);
-    const optionsBearing = OPTION_BACKED_TYPES.has(field.type as PropertyFieldType);
+    const optionsBearing = OPTION_BACKED_FIELD_TYPES.has(field.type);
 
     if (Array.isArray(raw)) {
         const unresolvedOptionIds: string[] = [];
-        const names = raw.map((id) => {
-            const name = options.find((option) => option.id === id)?.name;
-            if (name === undefined && optionsBearing) {
+        const displayValues = raw.map((id) => {
+            const option = options.find((candidate) => candidate.id === id);
+            if (option === undefined && optionsBearing) {
                 unresolvedOptionIds.push(String(id));
             }
-            return name ?? String(id);
+            return {value: option?.name ?? String(id), color: option?.color};
         });
         return {
-            displayValue: names.join(', '),
+            displayValue: displayValues.map((entry) => entry.value).join(', '),
+            displayValues,
             unresolvedOptionIds: unresolvedOptionIds.length > 0 ? unresolvedOptionIds : undefined,
         };
     }
 
     if (typeof raw !== 'string') {
-        return {displayValue: String(raw)};
+        const value = String(raw);
+        return {displayValue: value, displayValues: [{value}]};
     }
 
     const option = options.find((candidate) => candidate.id === raw);
     if (option) {
-        return {option, displayValue: option.name};
+        return {option, displayValue: option.name, displayValues: [{value: option.name, color: option.color}]};
     }
 
     // Text fields store the display string directly. A select field whose option
@@ -206,6 +468,7 @@ function resolveDisplayValue(field: ChannelAttributeField, raw: unknown): Pick<R
     // visible — better than silently dropping a marking.
     return {
         displayValue: raw,
+        displayValues: [{value: raw}],
         unresolvedOptionIds: optionsBearing ? [raw] : undefined,
     };
 }
@@ -256,25 +519,175 @@ export function selectAttributesForAction(
 }
 
 /**
- * The attributes listed in Channel Info: designated for the info surface, and
- * either set or required.
- *
- * Wider than selectAttributesForAction on purpose — a required attribute is
- * listed even when unset, because that empty row is the only thing telling an
- * administrator the channel is incomplete. Optional unset attributes are
- * reachable through Add attribute instead, which is a later story.
+ * Ignores display configuration, since Channel Info is the editing surface. Required
+ * unset rows are checked per field: a custom role may edit a member-tier field
+ * without manage_channel_roles.
  */
 export function selectChannelInfoAttributes(
     attributes: ResolvedChannelAttribute[],
-    action: PropertyFieldAction,
+    permissions: ChannelAttributePermissions,
 ): ResolvedChannelAttribute[] {
     const listed = attributes.filter((attribute) => {
-        if (!hasAction(attribute.field, action)) {
-            return false;
+        if (isPropertyValueSet(attribute.rawValue)) {
+            return true;
         }
-        return Boolean(attribute.displayValue) || isPropertyFieldRequired(attribute.field);
+        return isPropertyFieldRequired(attribute.field) && canEditAttributeField(attribute.field, permissions);
     });
     return listed.length === 0 ? EMPTY_RESOLVED : listed;
+}
+
+export type ChannelAttributeChipItem = {
+    key: string;
+    fieldId: string;
+    label: string;
+    value: string;
+    color?: string;
+    testID: string;
+};
+
+/**
+ * Flattens every attribute's values into individual chip items, one per value,
+ * so a caller can cap overflow by chip count rather than attribute count. An
+ * attribute with a single value keeps the bare `{testIDPrefix}.{field.name}`
+ * testID it has always used; an attribute with several values gets an index
+ * suffix per chip so each one stays addressable.
+ */
+export function flattenChannelAttributesToChips(attributes: ResolvedChannelAttribute[], testIDPrefix: string): ChannelAttributeChipItem[] {
+    return attributes.flatMap((attribute) => {
+        const label = getPropertyFieldLabel(attribute.field);
+        const multiValue = attribute.displayValues.length > 1;
+        return attribute.displayValues.map((entry, index) => ({
+            key: `${attribute.field.id}-${index}`,
+            fieldId: attribute.field.id,
+            label,
+            value: entry.value,
+            color: entry.color,
+            testID: multiValue ? `${testIDPrefix}.${attribute.field.name}.${index}` : `${testIDPrefix}.${attribute.field.name}`,
+        }));
+    });
+}
+
+export type ChannelAttributeChipGroup = {
+    fieldId: string;
+    label: string;
+    items: ChannelAttributeChipItem[];
+};
+
+/**
+ * Groups chip items back by field, in order, so a caller can render one row
+ * per field with every value of that field as its own chip.
+ */
+export function groupChannelAttributeChipsByField(items: ChannelAttributeChipItem[]): ChannelAttributeChipGroup[] {
+    const groups: ChannelAttributeChipGroup[] = [];
+    const byFieldId = new Map<string, ChannelAttributeChipGroup>();
+    for (const item of items) {
+        let group = byFieldId.get(item.fieldId);
+        if (!group) {
+            group = {fieldId: item.fieldId, label: item.label, items: []};
+            byFieldId.set(item.fieldId, group);
+            groups.push(group);
+        }
+        group.items.push(item);
+    }
+    return groups;
+}
+
+/**
+ * Everything the downstream surfaces read, as one string per attribute.
+ *
+ * The configuration keys have to be in here, not just the rendered value: which
+ * surface an attribute appears on is decided *after* this comparator runs, by
+ * selectAttributesForAction and selectChannelInfoAttributes reading attrs.actions
+ * and attrs.required.
+ */
+function renderSignature(attribute: ResolvedChannelAttribute): string {
+    const {attrs} = attribute.field;
+    const actions = Array.isArray(attrs?.actions) ? attrs.actions.join(',') : '';
+
+    return [
+        attribute.field.id,
+        attribute.field.name,
+        attribute.field.type,
+        attribute.displayValue,
+
+        // Two options can share a name and colour, so the display string alone misses a switch.
+        JSON.stringify(attribute.rawValue ?? null),
+        attribute.option?.color ?? '',
+
+        // Multi-valued attributes carry per-value colors, never an option, so
+        // an option color change only shows up here.
+        attribute.displayValues.map((entry) => entry.color ?? '').join(','),
+        attribute.unresolvedOptionIds?.join(',') ?? '',
+        actions,
+        attrs?.required === true ? '1' : '0',
+        attrs?.display_name ?? '',
+        typeof attrs?.sort_order === 'number' ? String(attrs.sort_order) : '',
+        ...editorSignatureKeys(attribute.field),
+    ].join('|');
+}
+
+// What the editor gates on and offers, so a policy, tier or option change reaches an open row.
+function editorSignatureKeys(field: ChannelAttributeField): string[] {
+    const {attrs} = field;
+
+    return [
+        attrs?.change_policy ?? '',
+        attrs?.editable === false ? '0' : '1',
+        typeof field.permissionValues === 'string' ? field.permissionValues : '',
+        optionsSignature(field),
+    ];
+}
+
+function optionsSignature(field: ChannelAttributeField): string {
+    const {attrs} = field;
+    return Array.isArray(attrs?.options) ? attrs.options.map((option) => [option.id, option.rank ?? '', option.color ?? '', option.name].join(SIGNATURE_SEPARATOR)).join(SIGNATURE_SEPARATOR) : '';
+}
+
+/**
+ * Take this at emission time, not inside distinctUntilChanged: WatermelonDB updates
+ * records in place and re-emits the same instance, so a comparator sees new attrs on both sides.
+ */
+export function resolvedAttributesSignature(attributes: ResolvedChannelAttribute[]): string {
+    return attributes.map(renderSignature).join(SIGNATURE_SEPARATOR);
+}
+
+// Narrower than renderSignature: Channel Info ignores display actions, so toggling
+// "show in header" must not re-render it.
+function channelInfoSignature(attribute: ResolvedChannelAttribute): string {
+    return [
+        attribute.field.id,
+        attribute.field.name,
+        attribute.field.type,
+        getPropertyFieldLabel(attribute.field),
+        JSON.stringify(attribute.rawValue ?? null),
+        attribute.displayValues.map((entry) => [entry.value, entry.color ?? ''].join(SIGNATURE_SEPARATOR)).join(SIGNATURE_SEPARATOR),
+        attribute.unresolvedOptionIds?.join(',') ?? '',
+        isPropertyFieldRequired(attribute.field) ? '1' : '0',
+        ...editorSignatureKeys(attribute.field),
+    ].join('|');
+}
+
+// Snapshot; see resolvedAttributesSignature.
+export function channelInfoAttributesSignature(attributes: ResolvedChannelAttribute[]): string {
+    return attributes.map(channelInfoSignature).join(SIGNATURE_SEPARATOR);
+}
+
+function creatableFieldSignature(field: ChannelAttributeField): string {
+    return [
+        field.id,
+        field.name,
+        field.type,
+        field.permissionValues ?? '',
+        isPropertyFieldRequired(field) ? '1' : '0',
+        field.attrs?.display_name ?? '',
+        typeof field.attrs?.sort_order === 'number' ? String(field.attrs.sort_order) : '',
+        optionsSignature(field),
+    ].join(SIGNATURE_SEPARATOR);
+}
+
+// Snapshot; see resolvedAttributesSignature.
+export function creatableFieldsSignature(fields: ChannelAttributeField[]): string {
+    return fields.map(creatableFieldSignature).join('|');
 }
 
 function hasAction(field: ChannelAttributeField, action: PropertyFieldAction): boolean {
@@ -301,13 +714,22 @@ function hasNoDisplayConfiguration(field: ChannelAttributeField): boolean {
 }
 
 /**
- * Resolves one channel banner from every attribute designated for that surface.
+ * Resolves one channel banner from every attribute designated for that surface,
+ * following the same rules as the webapp.
  *
  * Falls back to the classification field while that field carries no display
  * configuration at all, which is how an install that upgraded before an
  * administrator configured anything keeps the banner it has today. The fallback
  * switches off as soon as the field carries any actions, so an unticked Banner
  * means no banner.
+ *
+ * On the designated path the channel's own banner settings are honored: once a
+ * channel has authored banner text, switching its banner off hides it whatever
+ * attributes are designated, unless one of them is required. The authored text
+ * wins over the designated default even when every attribute it references is
+ * unset. Classification's color is enforced only while classification actually
+ * appears on the banner; once the channel removes its token, the color is the
+ * channel's.
  *
  * The classification field is matched by name because mobile does not persist
  * linked_field_id. That is sufficient rather than lax: the template field is
@@ -316,14 +738,13 @@ function hasNoDisplayConfiguration(field: ChannelAttributeField): boolean {
  *
  * @param fields channel-object fields in the access_control group, any order
  * @param values every property value on this channel
- * @param nativeBannerText the channel's own banner_info.text template
- * @param authoredColor the channel's own banner_info.background_color
+ * @param [bannerInfo] the channel's own banner_info: template, color and toggle
+ * @param [attributesEnabled] whether the channel attributes feature is on
  */
 export function deriveChannelAttributeBanner(
     fields: ChannelAttributeField[],
     values: ChannelAttributeValue[],
-    nativeBannerText?: string,
-    authoredColor?: string,
+    bannerInfo?: ChannelBannerInfo,
     attributesEnabled = false,
 ): ChannelAttributeBannerState {
     const ordered = [...fields].sort(compareChannelAttributeFields);
@@ -335,26 +756,26 @@ export function deriveChannelAttributeBanner(
     const candidates = attributesEnabled ? ordered : ordered.filter((field) => field.name === CLASSIFICATIONS_FIELD_NAME);
 
     const designatedFields = candidates.filter(hasBannerAction);
-    const designated = designatedFields[0];
     const fallback = designatedFields.length > 0 ? undefined : candidates.find(
         (field) => field.name === CLASSIFICATIONS_FIELD_NAME && hasNoDisplayConfiguration(field),
     );
 
-    const bannerField = designated ?? fallback;
-    if (!bannerField) {
+    if (designatedFields.length === 0 && !fallback) {
         return NO_BANNER;
     }
 
     const resolvedAttributes = resolveChannelAttributes(ordered, values);
+    const templateAttributes = withoutUnresolvedOptions(resolvedAttributes);
+    const authoredText = bannerInfo?.text;
 
-    if (designatedFields.length === 0) {
-        const resolved = resolvedAttributes.find((attribute) => attribute.field.id === bannerField.id);
+    if (fallback) {
+        const resolved = resolvedAttributes.find((attribute) => attribute.field.id === fallback.id);
         if (!resolved?.option?.name || resolved.unresolvedOptionIds?.length) {
             return NO_BANNER;
         }
 
-        const text = nativeBannerText ?
-            renderBannerTemplate(nativeBannerText, resolvedAttributes) :
+        const text = authoredText ?
+            renderBannerTemplate(authoredText, templateAttributes) :
             `**${resolved.option.name}**`;
         if (!text) {
             return NO_BANNER;
@@ -370,28 +791,45 @@ export function deriveChannelAttributeBanner(
         };
     }
 
+    // A channel that never authored a banner carries enabled=false and still shows
+    // the designated default, so the toggle only counts once text exists.
+    const bannerRequired = designatedFields.some(isPropertyFieldRequired);
+    if (authoredText !== undefined && !bannerInfo?.enabled && !bannerRequired) {
+        return NO_BANNER;
+    }
+
     const contributions = designatedFields.
         map((field) => resolvedAttributes.find((attribute) => attribute.field.id === field.id)).
         filter((attribute): attribute is ResolvedChannelAttribute => Boolean(
             attribute?.displayValue && !attribute.unresolvedOptionIds?.length,
         ));
 
-    if (contributions.length === 0) {
+    let text: string;
+    if (authoredText !== undefined) {
+        text = authoredText ? renderBannerTemplate(authoredText, templateAttributes) : '';
+    } else if (contributions.length === 0) {
+        return NO_BANNER;
+    } else {
+        text = contributions.map((attribute) => attribute.displayValue).join(' · ');
+    }
+    if (!text.trim()) {
         return NO_BANNER;
     }
 
-    const text = nativeBannerText ?
-        renderBannerTemplate(nativeBannerText, resolvedAttributes) :
-        contributions.map((attribute) => attribute.displayValue).join(' · ');
-    if (!text) {
-        return NO_BANNER;
-    }
-
-    const classificationDesignated = designatedFields.some((field) => field.name === CLASSIFICATIONS_FIELD_NAME);
     const classificationContribution = contributions.find((attribute) => attribute.field.name === CLASSIFICATIONS_FIELD_NAME);
-    const backgroundColor = classificationDesignated ?
-        classificationContribution?.option?.color || DEFAULT_BANNER_COLOR :
-        authoredColor || (contributions.length === 1 ? contributions[0].option?.color : undefined) || DEFAULT_BANNER_COLOR;
+    const classificationColor = classificationContribution?.option?.color;
+    const classificationInBanner = Boolean(classificationColor) &&
+        (authoredText === undefined || hasAttributeToken(authoredText, CLASSIFICATIONS_FIELD_NAME));
+
+    let backgroundColor: string;
+    if (classificationInBanner && classificationColor) {
+        backgroundColor = classificationColor;
+    } else {
+        const colorContributions = contributions.filter((attribute) => attribute !== classificationContribution);
+        backgroundColor = bannerInfo?.background_color ||
+            (colorContributions.length === 1 ? colorContributions[0].option?.color : undefined) ||
+            DEFAULT_BANNER_COLOR;
+    }
 
     return {
         hasBanner: true,
@@ -403,12 +841,56 @@ export function deriveChannelAttributeBanner(
     };
 }
 
+// A deleted option would otherwise render its raw id in the banner.
+function withoutUnresolvedOptions(attributes: ResolvedChannelAttribute[]): ResolvedChannelAttribute[] {
+    if (!attributes.some((attribute) => attribute.unresolvedOptionIds?.length)) {
+        return attributes;
+    }
+    return attributes.map((attribute) => (attribute.unresolvedOptionIds?.length ? {...attribute, displayValue: '', displayValues: []} : attribute));
+}
+
 // Separators the banner composer offers. Excludes '-' and '/': a banner authored
 // as "- {{classification}}" is a markdown list, and stripping its marker would
 // rewrite what the author wrote.
 const SEPARATORS = '·|';
 
 const TOKEN_PATTERN = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
+
+/**
+ * The channel's own banner_info text with its template resolved against this
+ * channel's attribute values, matching the webapp.
+ *
+ * The native banner shows when no designated attribute has a value, and its
+ * text is the same template the attribute banner renders, so without this an
+ * unset attribute leaves its raw "{{name}}" token on screen. With channel
+ * attributes off the text passes through untouched, as on the webapp.
+ *
+ * @param fields channel-object fields in the access_control group, any order
+ * @param values every property value on this channel
+ * @param [nativeBannerText] the channel's own banner_info.text template
+ * @param [attributesEnabled] whether the channel attributes feature is on
+ */
+export function renderNativeBannerText(
+    fields: ChannelAttributeField[],
+    values: ChannelAttributeValue[],
+    nativeBannerText?: string,
+    attributesEnabled = false,
+): string | undefined {
+    if (!attributesEnabled || !nativeBannerText?.includes('{{')) {
+        return nativeBannerText;
+    }
+
+    return renderBannerTemplate(nativeBannerText, resolveChannelAttributes(fields, values));
+}
+
+export function hasAttributeToken(text: string, fieldName: string): boolean {
+    for (const match of text.matchAll(TOKEN_PATTERN)) {
+        if (match[1] === fieldName) {
+            return true;
+        }
+    }
+    return false;
+}
 
 export function renderBannerTemplate(template: string, attributes: ResolvedChannelAttribute[]): string {
     if (!template || !template.includes('{{')) {

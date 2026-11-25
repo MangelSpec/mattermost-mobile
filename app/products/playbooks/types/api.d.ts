@@ -20,6 +20,12 @@ type TaskAction = {
     actions: TriggerAction[];
 }
 
+type TaskRequirement = {
+    id: string;
+    label: string;
+    value: string;
+}
+
 type PlaybookChecklistItem = {
     id: string;
     title: string;
@@ -32,10 +38,16 @@ type PlaybookChecklistItem = {
     command_last_run: number;
     due_date: number;
     task_actions?: TaskAction[];
+    requirements?: TaskRequirement[];
     condition_action?: ConditionAction;
     condition_reason?: string;
     completed_at: number;
     update_at: number;
+}
+
+type PlaybooksGlobalSettings = {
+    enable_experimental_features: boolean;
+    enable_task_requirements: boolean;
 }
 
 type ChecklistItemInput = {
@@ -66,6 +78,9 @@ type TimelineEvent = {
     id: string;
     playbook_run_id: string;
     create_at: number;
+
+    // The server does not send soft deletes; filtered out only as a precaution.
+    delete_at?: number;
     event_at: number;
     event_type: string;
     summary: string;
@@ -140,7 +155,9 @@ type PlaybookRun = {
     remove_channel_member_on_removed_participant: boolean;
     invited_user_ids: string[];
     invited_group_ids: string[];
-    timeline_events: TimelineEvent[];
+
+    // null, not [], when the run has no events: the server sends a Go nil slice.
+    timeline_events: TimelineEvent[] | null;
     participant_ids: string[];
     broadcast_channel_ids: string[];
     webhook_on_creation_urls: string[];

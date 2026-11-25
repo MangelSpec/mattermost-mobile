@@ -60,7 +60,7 @@ const {PLAYBOOK_RUN, PLAYBOOK_CHECKLIST, PLAYBOOK_CHECKLIST_ITEM, PLAYBOOK_RUN_A
 describe('*** Test schema for SERVER database ***', () => {
     it('=> The SERVER SCHEMA should strictly match', () => {
         expect(serverSchema).toEqual({
-            version: 21,
+            version: 25,
             unsafeSql: undefined,
             tables: {
                 [AI_BOT]: {
@@ -325,6 +325,7 @@ describe('*** Test schema for SERVER database ***', () => {
                         last_playbook_runs_fetch_at: {name: 'last_playbook_runs_fetch_at', type: 'number'},
                         autotranslation_disabled: {name: 'autotranslation_disabled', type: 'boolean', isOptional: true},
                         urgent_mention_count: {name: 'urgent_mention_count', type: 'number'},
+                        redaction_required_epoch: {name: 'redaction_required_epoch', type: 'number'},
                     },
                     columnArray: [
                         {name: 'is_unread', type: 'boolean'},
@@ -339,6 +340,7 @@ describe('*** Test schema for SERVER database ***', () => {
                         {name: 'last_playbook_runs_fetch_at', type: 'number'},
                         {name: 'autotranslation_disabled', type: 'boolean', isOptional: true},
                         {name: 'urgent_mention_count', type: 'number'},
+                        {name: 'redaction_required_epoch', type: 'number'},
                     ],
                 },
                 [MY_CHANNEL_SETTINGS]: {
@@ -512,6 +514,7 @@ describe('*** Test schema for SERVER database ***', () => {
                         active_stage: {name: 'active_stage', type: 'number'},
                         active_stage_title: {name: 'active_stage_title', type: 'string'},
                         participant_ids: {name: 'participant_ids', type: 'string'}, // JSON string
+                        timeline_events: {name: 'timeline_events', type: 'string', isOptional: true}, // JSON string
                         summary: {name: 'summary', type: 'string'},
                         current_status: {name: 'current_status', type: 'string', isIndexed: true},
                         last_status_update_at: {name: 'last_status_update_at', type: 'number'},
@@ -539,6 +542,7 @@ describe('*** Test schema for SERVER database ***', () => {
                         {name: 'active_stage', type: 'number'},
                         {name: 'active_stage_title', type: 'string'},
                         {name: 'participant_ids', type: 'string'}, // JSON string
+                        {name: 'timeline_events', type: 'string', isOptional: true}, // JSON string
                         {name: 'summary', type: 'string'},
                         {name: 'current_status', type: 'string', isIndexed: true},
                         {name: 'last_status_update_at', type: 'number'},
@@ -589,6 +593,7 @@ describe('*** Test schema for SERVER database ***', () => {
                         due_date: {name: 'due_date', type: 'number'},
                         completed_at: {name: 'completed_at', type: 'number'},
                         task_actions: {name: 'task_actions', type: 'string', isOptional: true}, // JSON string
+                        requirements: {name: 'requirements', type: 'string', isOptional: true}, // JSON string
                         condition_action: {name: 'condition_action', type: 'string'},
                         condition_reason: {name: 'condition_reason', type: 'string'},
                         sync: {name: 'sync', type: 'string', isIndexed: true, isOptional: true},
@@ -608,6 +613,7 @@ describe('*** Test schema for SERVER database ***', () => {
                         {name: 'due_date', type: 'number'},
                         {name: 'completed_at', type: 'number'},
                         {name: 'task_actions', type: 'string', isOptional: true}, // JSON string
+                        {name: 'requirements', type: 'string', isOptional: true}, // JSON string
                         {name: 'condition_action', type: 'string'},
                         {name: 'condition_reason', type: 'string'},
                         {name: 'sync', type: 'string', isIndexed: true, isOptional: true},
@@ -687,6 +693,7 @@ describe('*** Test schema for SERVER database ***', () => {
                         pending_post_id: {name: 'pending_post_id', type: 'string', isIndexed: true},
                         previous_post_id: {name: 'previous_post_id', type: 'string'},
                         props: {name: 'props', type: 'string'},
+                        redaction_verified_epoch: {name: 'redaction_verified_epoch', type: 'number'},
                         root_id: {name: 'root_id', type: 'string'},
                         type: {name: 'type', type: 'string', isIndexed: true},
                         update_at: {name: 'update_at', type: 'number'},
@@ -705,6 +712,7 @@ describe('*** Test schema for SERVER database ***', () => {
                         {name: 'pending_post_id', type: 'string', isIndexed: true},
                         {name: 'previous_post_id', type: 'string'},
                         {name: 'props', type: 'string'},
+                        {name: 'redaction_verified_epoch', type: 'number'},
                         {name: 'root_id', type: 'string'},
                         {name: 'type', type: 'string', isIndexed: true},
                         {name: 'update_at', type: 'number'},
@@ -780,6 +788,8 @@ describe('*** Test schema for SERVER database ***', () => {
                         processed_at: {name: 'processed_at', type: 'number'},
                         error_code: {name: 'error_code', type: 'string'},
                         type: {name: 'type', type: 'string', isOptional: true},
+                        repeat_type: {name: 'repeat_type', type: 'string'},
+                        repeat_timezone: {name: 'repeat_timezone', type: 'string'},
                     },
                     columnArray: [
                         {name: 'channel_id', type: 'string', isIndexed: true},
@@ -793,6 +803,8 @@ describe('*** Test schema for SERVER database ***', () => {
                         {name: 'processed_at', type: 'number'},
                         {name: 'error_code', type: 'string'},
                         {name: 'type', type: 'string', isOptional: true},
+                        {name: 'repeat_type', type: 'string'},
+                        {name: 'repeat_timezone', type: 'string'},
                     ],
                 },
                 [SYSTEM]: {

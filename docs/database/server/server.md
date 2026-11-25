@@ -1,4 +1,4 @@
-# Server Database - Schema Version 21
+# Server Database - Schema Version 25
 # Please bump the version by 1, any time the schema changes.
 # Also, include the migration plan under app/database/migration/server,
 # update all models, relationships and types.
@@ -113,6 +113,8 @@ scheduled_at number
 processed_at number NULL
 error_code string
 type string NULL
+repeat_type string
+repeat_timezone string
 
 
 File
@@ -181,6 +183,7 @@ message_count number
 roles string
 viewed_at number
 autotranslation_disabled boolean
+redaction_required_epoch number
 
 
 MyChannelSettings
@@ -204,6 +207,7 @@ is_active boolean
 active_stage number
 active_stage_title string
 participant_ids string # stringified array of user IDs
+timeline_events string NULL # stringified array of task_state_modified timeline events; other event types are not stored
 summary string
 current_status string # (valid values InProgres, Finished)
 owner_user_id string INDEX FK >- User.id
@@ -243,6 +247,7 @@ command string
 command_last_run number
 due_date number
 task_actions string # stringified array of TaskAction
+requirements string NULL # stringified array of TaskRequirement ({id, label, value})
 condition_action string # condition action for the checklist item (values should be '' or 'hidden')
 condition_reason string # condition reason for the checklist item (default empty string meaning there is no condition affecting)
 order number
@@ -284,6 +289,7 @@ original_id string
 pending_post_id string INDEX
 previous_post_id string
 props string
+redaction_verified_epoch number
 root_id string
 type string INDEX
 update_at number

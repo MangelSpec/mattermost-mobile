@@ -32,6 +32,13 @@ on:
         required: false
         type: string
         default: ""
+      results-artifact:
+        description: >
+          Artifact name for this run's Maestro JUnit report: a re-run of failed flows (flow-path),
+          with an empty tsio-config and run-type NONE, reports only to the channel message.
+        required: false
+        type: string
+        default: ""
       record_tests_in_zephyr:
         description: "Record Maestro test results in Zephyr Scale (release/main runs)"
         required: false
@@ -49,13 +56,34 @@ on:
         required: false
         type: string
         default: ""
+      e2e_test_stack:
+        description: "Run on a one-server e2e-test-stack batch instead of the MM_TEST_SERVER_URL server"
+        type: boolean
+        default: false
+      e2e_test_stack_account:
+        description: "e2e-test-stack only: the AWS account of the control plane, prod or dev"
+        type: string
+        default: "prod"
+      e2e_test_stack_channel:
+        description: "e2e-test-stack only: the control plane channel, v1 or edge"
+        type: string
+        default: "v1"
+      e2e_test_stack_server_image:
+        description: "e2e-test-stack only: the Mattermost server image, master, latest, esr or an image by tag"
+        type: string
+        default: "master"
+      e2e_test_stack_batch:
+        description: "e2e-test-stack only: this platform's batch name, which create, provision and the test job use"
+        type: string
+        default: ""
     secrets:
+      # Not on e2e-test-stack, where the batch has its own admin.
       MM_MOBILE_E2E_ADMIN_EMAIL:
-        required: true
+        required: false
       MM_MOBILE_E2E_ADMIN_USERNAME:
-        required: true
+        required: false
       MM_MOBILE_E2E_ADMIN_PASSWORD:
-        required: true
+        required: false
       MM_MOBILE_E2E_ZEPHYR_API_KEY:
         required: false
       MM_MOBILE_DETOX_AWS_ACCESS_KEY_ID:
@@ -69,6 +97,9 @@ on:
       MM_E2E_MASTER_HEALTH_WEBHOOK_URL:
         required: false
       MM_E2E_RELEASE_WEBHOOK_URL:
+        required: false
+      # e2e-test-stack only: the repository's credentials key, which opens the batch's sealed server credentials.
+      E2E_TEST_STACK_CREDENTIALS_KEY:
         required: false
     outputs:
       STATUS:
@@ -129,10 +160,81 @@ env:
   COMMIT_HASH: ${{ inputs.MOBILE_VERSION || github.sha }}
 
 jobs:
+  # e2e-test-stack only, before any server is created: code under test from before e2e-test-stack provisioning
+  # would download the plugins the server image carries instead of enabling them.
+  e2e-test-stack-check:
+    if: inputs.e2e_test_stack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      commit-sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ inputs.MOBILE_VERSION }}
+          sparse-checkout: detox/provision
+          persist-credentials: false
+
+      - name: ci/e2e-test-stack-check-provision-code
+        run: |
+          if ! grep -rqE '^export function isE2eTestStack\(' detox/provision; then
+            echo "::error::the code under test predates e2e-test-stack provisioning; merge main into it"
+            exit 1
+          fi
+
+      # The commit MOBILE_VERSION names, so provisioning runs the code this job checked.
+      - name: ci/commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # e2e-test-stack only: this platform's batch, one server, which SITE_1 is.
+  e2e-test-stack-create:
+    if: inputs.e2e_test_stack
+    needs: e2e-test-stack-check
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/e2e-test-stack-create.yml
+    with:
+      batch: ${{ inputs.e2e_test_stack_batch }}
+      account: ${{ inputs.e2e_test_stack_account }}
+      channel: ${{ inputs.e2e_test_stack_channel }}
+      server_image: ${{ inputs.e2e_test_stack_server_image }}
+      count: "1"
+      license: enterprise-advanced
+      shared_admin_password: true
+      # 4h from create: the runner queue, the job timeout, and a re-run have to finish inside it.
+      ttl: 4h
+    secrets:
+      E2E_TEST_STACK_CREDENTIALS_KEY: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
+
+  # The batch's one server, provisioned as provision-e2e-servers does (license and plugins). As the last
+  # server of its batch it gets no demo plugin, which no Maestro flow uses.
+  e2e-test-stack-provision:
+    if: inputs.e2e_test_stack
+    needs: [e2e-test-stack-check, e2e-test-stack-create]
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/e2e-test-stack-provision.yml
+    with:
+      batch: ${{ inputs.e2e_test_stack_batch }}
+      slices: '["0"]'
+      commit_sha: ${{ needs.e2e-test-stack-check.outputs.commit-sha }}
+    secrets:
+      E2E_TEST_STACK_CREDENTIALS_KEY: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
+
   e2e-maestro-ios:
     # TSIO shard label = job name; prefer tsio-shard-name (e.g. maestro-ios-e2e).
     name: ${{ inputs.tsio-shard-name != '' && inputs.tsio-shard-name || 'Maestro E2E Tests (iOS)' }}
-    if: ${{ inputs.platform == 'ios' || inputs.platform == '' }}
+    needs: e2e-test-stack-provision
+    # Today's server: always. e2e-test-stack: once this platform's batch is ready.
+    if: >-
+      !cancelled() && (inputs.platform == 'ios' || inputs.platform == '') &&
+      (!inputs.e2e_test_stack || needs.e2e-test-stack-provision.result == 'success')
     runs-on: macos-26
     timeout-minutes: 90
     outputs:
@@ -146,10 +248,64 @@ jobs:
       ERRORS: ${{ steps.summary.outputs.ERRORS }}
       CANCELLED: ${{ steps.shard-cancelled.outputs.CANCELLED }}
     steps:
+      # Off e2e-test-stack, the admin comes from the MM_MOBILE_E2E_ADMIN_* secrets.
+      - name: ci/check-admin-secrets
+        if: ${{ !inputs.e2e_test_stack }}
+        run: |
+          if [ -z "$ADMIN_USERNAME" ] || [ -z "$ADMIN_PASSWORD" ]; then
+            echo "::error::MM_MOBILE_E2E_ADMIN_USERNAME and MM_MOBILE_E2E_ADMIN_PASSWORD are required off e2e-test-stack"
+            exit 1
+          fi
+
       - name: Checkout Repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ inputs.MOBILE_VERSION }}
+
+      # e2e-test-stack only: the open action runs on Node 26; prepare-node-deps then switches to the specs' version.
+      - name: ci/e2e-test-stack-setup-node
+        if: inputs.e2e_test_stack
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+          package-manager-cache: false
+
+      # e2e-test-stack only: reads this run's create response, from whichever attempt created the batch.
+      - name: ci/e2e-test-stack-open
+        id: e2e-test-stack-open
+        if: inputs.e2e_test_stack
+        uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-test-stack/open@d6488ead2b451fe6f6ecf687c4d46467b896b514 # main
+        with:
+          caller-key: mobile
+          batch: ${{ inputs.e2e_test_stack_batch }}
+          index: "0"
+          credentials-key: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
+
+      # e2e-test-stack only: the batch's server as SITE_1, with its admin, in place of MM_TEST_SERVER_URL and the
+      # MM_MOBILE_E2E_ADMIN_* secrets.
+      - name: ci/e2e-test-stack-server
+        if: inputs.e2e_test_stack
+        env:
+          BATCH: ${{ inputs.e2e_test_stack_batch }}
+          INSTANCES: ${{ steps.e2e-test-stack-open.outputs.instances }}
+        run: |
+          set -euo pipefail
+          field() { jq -r --arg f "$1" '.[0][$f] // ""' <<< "$INSTANCES"; }
+          site=$(field site_url)
+          username=$(field admin_username)
+          password=$(field admin_password)
+          email=$(field admin_email)
+          if [ -z "$site" ] || [ -z "$username" ] || [ -z "$password" ]; then
+            echo "::error::the ${BATCH} batch has no server with a site and an admin"
+            exit 1
+          fi
+          {
+            echo "SITE_1_URL=$site"
+            echo "ADMIN_USERNAME=$username"
+            echo "ADMIN_PASSWORD=$password"
+            echo "ADMIN_EMAIL=$email"
+          } >> "$GITHUB_ENV"
+          echo "SITE_1=$site"
 
       - name: ci/prepare-node-deps
         uses: ./.github/actions/prepare-node-deps
@@ -162,7 +318,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.maestro
-          key: maestro-00f516729f57d48f36ded55244cfbe358ada6b00-macos
+          key: maestro-c8c361be1cc89b2e742f185466a302a22778be6b-macos
 
       - name: Install Maestro CLI
         if: steps.maestro-cache.outputs.cache-hit != 'true'
@@ -381,7 +537,8 @@ jobs:
           fi
 
       - name: Run MM-T67856_4 with AllowDownloadLogs=false (iOS)
-        if: always() && hashFiles('detox/maestro/.maestro-test-env.sh') != '' && steps.maestro-ios-preflight.conclusion == 'success'
+        # A re-run of failed flows runs only those (flow-path).
+        if: always() && inputs.results-artifact == '' && hashFiles('detox/maestro/.maestro-test-env.sh') != '' && steps.maestro-ios-preflight.conclusion == 'success'
         continue-on-error: true
         run: |
           set -a
@@ -401,7 +558,7 @@ jobs:
           # asserts against a toggle the server never turned off. Same treatment
           # ReportAProblemType already gets below.
           echo "==> Patching SupportSettings.AllowDownloadLogs=false on ${SITE_1_URL}"
-          bash detox/maestro/scripts/apply_client_config_value.sh \
+          CONFIG_DIAGNOSIS_FILE="$RUNNER_TEMP/config-diagnosis.txt" bash detox/maestro/scripts/apply_client_config_value.sh \
             "${SITE_1_URL}" "$ADMIN_TOKEN" '{"SupportSettings":{"AllowDownloadLogs":false}}' \
             AllowDownloadLogs false || {
               rc=$?
@@ -417,12 +574,20 @@ jobs:
               bash detox/maestro/scripts/write_maestro_failure_stub.sh \
                 build/maestro-report-T67856_4.xml \
                 detox/maestro/flows/account/attach_logs_disabled_when_download_logs_off.yml \
-                "AllowDownloadLogs=false never reached the client config; the flow's pre-condition was not in force"
+                "AllowDownloadLogs=false never reached the client config; the flow's pre-condition was not in force: $(cat "$RUNNER_TEMP/config-diagnosis.txt" 2>/dev/null)"
               exit 1
             }
 
+          bash detox/maestro/scripts/reset_ios_app.sh "$SIMULATOR_ID" com.mattermost.rnbeta || {
+            bash detox/maestro/scripts/write_maestro_failure_stub.sh \
+              build/maestro-report-T67856_4.xml \
+              detox/maestro/flows/account/attach_logs_disabled_when_download_logs_off.yml \
+              "The app could not be reinstalled for a clean state before the flow"
+            exit 1
+          }
           ~/.maestro/bin/maestro test \
             --device "$SIMULATOR_ID" \
+            --env MAESTRO_APP_RESET_BY_RUNNER=true \
             --format junit \
             --output build/maestro-report-T67856_4.xml \
             --test-output-dir build/maestro-artifacts-T67856_4 \
@@ -442,7 +607,8 @@ jobs:
         # link-mode flow, restore the default on exit. The flow has no onFlowStart hook
         # of its own, so the patch and the trap restore live here. continue-on-error so
         # the main batch report stays authoritative.
-        if: always() && hashFiles('detox/maestro/.maestro-test-env.sh') != '' && steps.maestro-ios-preflight.conclusion == 'success'
+        # A re-run of failed flows runs only those (flow-path).
+        if: always() && inputs.results-artifact == '' && hashFiles('detox/maestro/.maestro-test-env.sh') != '' && steps.maestro-ios-preflight.conclusion == 'success'
         continue-on-error: true
         run: |
           set -a
@@ -461,7 +627,7 @@ jobs:
           # restored 'default' 58 ms before this step patched, the app observed 'default',
           # and handleReport() emailed instead of opening the browser.
           echo "==> Patching SupportSettings.ReportAProblemType=link on ${SITE_1_URL}"
-          bash detox/maestro/scripts/apply_client_config_value.sh \
+          CONFIG_DIAGNOSIS_FILE="$RUNNER_TEMP/config-diagnosis.txt" bash detox/maestro/scripts/apply_client_config_value.sh \
             "${SITE_1_URL}" "$ADMIN_TOKEN" '{"SupportSettings":{"ReportAProblemType":"link","ReportAProblemLink":"https://mattermost.com/pl/report_a_problem_licensed"}}' \
             ReportAProblemType link || {
               rc=$?
@@ -479,12 +645,20 @@ jobs:
               bash detox/maestro/scripts/write_maestro_failure_stub.sh \
                 build/maestro-report-T3261_1.xml \
                 detox/maestro/flows/account/report_problem_link_mode.yml \
-                "ReportAProblemType=link never reached the client config; the flow's pre-condition was not in force"
+                "ReportAProblemType=link never reached the client config; the flow's pre-condition was not in force: $(cat "$RUNNER_TEMP/config-diagnosis.txt" 2>/dev/null)"
               exit 1
             }
 
+          bash detox/maestro/scripts/reset_ios_app.sh "$SIMULATOR_ID" com.mattermost.rnbeta || {
+            bash detox/maestro/scripts/write_maestro_failure_stub.sh \
+              build/maestro-report-T3261_1.xml \
+              detox/maestro/flows/account/report_problem_link_mode.yml \
+              "The app could not be reinstalled for a clean state before the flow"
+            exit 1
+          }
           ~/.maestro/bin/maestro test \
             --device "$SIMULATOR_ID" \
+            --env MAESTRO_APP_RESET_BY_RUNNER=true \
             --format junit \
             --output build/maestro-report-T3261_1.xml \
             --test-output-dir build/maestro-artifacts-T3261_1 \
@@ -514,18 +688,18 @@ jobs:
           # true is a harmless no-op, which keeps this safe when multiple jobs
           # share one server and a concurrent job re-flipped the flag.
           echo "==> Restoring SupportSettings.AllowDownloadLogs=true on ${SITE_1_URL}"
-          curl -f -sS --show-error --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 --retry-connrefused -X PUT \
-            -H "Authorization: Bearer $ADMIN_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d '{"SupportSettings":{"AllowDownloadLogs":true}}' \
-            "${SITE_1_URL}/api/v4/config/patch" > /dev/null && \
+          # Not curl --retry: a timed-out patch is still applied, and resending queues more saves behind it.
+          bash detox/maestro/scripts/apply_client_config_value.sh \
+            "${SITE_1_URL}" "$ADMIN_TOKEN" '{"SupportSettings":{"AllowDownloadLogs":true}}' \
+            AllowDownloadLogs true && \
             echo "==> Restored AllowDownloadLogs=true"
 
       - name: Upload Maestro Artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: maestro-ios-results-${{ github.run_id }}
+          # A re-run of failed flows runs in the same workflow run: its own name.
+          name: maestro-ios-results-${{ github.run_id }}${{ inputs.results-artifact != '' && '-rerun' || '' }}
           path: build/
 
       - name: Parse Maestro Report
@@ -577,6 +751,45 @@ jobs:
             }
           "
 
+      # Evidence for the triage job in e2e-detox-pr.yml: each failed flow's failure
+      # screenshot, the step it stopped at and the errors the app logged meanwhile.
+      # A re-run of failed flows hands its per-flow results to the channel message.
+      - name: Upload re-run results
+        if: always() && inputs.results-artifact != '' && hashFiles('build/maestro-report.xml') != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.results-artifact }}
+          path: build/maestro-report.xml
+          retention-days: 1
+
+      - name: Collect triage evidence
+        if: always() && inputs.tsio-shard-name != '' && hashFiles('build/maestro-report.xml') != ''
+        continue-on-error: true
+        run: node detox/utils/maestro-triage-evidence.js --report build/maestro-report.xml --build build --device-log build/sim-device.log --dir build/triage-evidence --out build/triage-evidence/evidence.json
+
+      - name: Upload triage evidence
+        id: upload-evidence
+        if: always() && inputs.tsio-shard-name != '' && hashFiles('build/triage-evidence/*.json') != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: triage-evidence-${{ inputs.tsio-shard-name }}-${{ github.run_id }}
+          path: build/triage-evidence/
+          overwrite: true
+
+      # The artifact service times out now and then ("Failed to CreateArtifact:
+      # ETIMEDOUT") and upload-artifact does not retry, which leaves triage with
+      # no evidence for this lane.
+      - name: Upload triage evidence (retry)
+        if: always() && steps.upload-evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: triage-evidence-${{ inputs.tsio-shard-name }}-${{ github.run_id }}
+          path: build/triage-evidence/
+          overwrite: true
+
       - name: Write TSIO failure stub when Maestro report is missing
         if: always() && inputs.tsio-config != '' && vars.TSIO_UPLOAD_ENABLED != 'false' && hashFiles('build/maestro-report.xml') == ''
         env:
@@ -606,7 +819,7 @@ jobs:
       # TSIO accepts framework=maestro (JUnit XML) since mattermost-test-system-io#76.
       - name: Upload report to Test System IO
         if: always() && inputs.tsio-config != '' && vars.TSIO_UPLOAD_ENABLED != 'false' && hashFiles('build/maestro-report.xml') != '' && steps.tsio-cfg.outputs.config != ''
-        uses: mattermost/mattermost-test-system-io/.github/actions/test-system-io-report-upload@0661accd8cc9ab9dde6ec93f6f5ad40d06deb0d3 # release-0.14.0 / main@0661acc (#93 unique release tags per run)
+        uses: mattermost/mattermost-test-system-io/.github/actions/test-system-io-report-upload@3212731263d782a3993dbdf4c8c54f143e69a7b2 # release-0.16.0 / main@3212731
         with:
           composite-identity: ${{ toJSON(fromJSON(steps.tsio-cfg.outputs.config).composite_identity) }}
           total-reports-expected: ${{ fromJSON(steps.tsio-cfg.outputs.config).total_reports_expected }}
@@ -624,36 +837,59 @@ jobs:
         if: always() && inputs.tsio-config != '' && vars.TSIO_UPLOAD_ENABLED != 'false' && steps.tsio-cfg.outputs.config != ''
         uses: ./.github/actions/e2e-override-label
         with:
-          pr_number: ${{ fromJSON(steps.tsio-cfg.outputs.config).composite_identity.gh_pr_number }}
+          # A trial e2e-test-stack/<lane> status is never overridden: it gates nothing.
+          pr_number: ${{ !startsWith(fromJSON(steps.tsio-cfg.outputs.config).status_context, 'e2e-test-stack/') && fromJSON(steps.tsio-cfg.outputs.config).composite_identity.gh_pr_number || '' }}
 
       - name: Post per-job TSIO commit status
+        id: tsio-status
         if: always() && inputs.tsio-config != '' && vars.TSIO_UPLOAD_ENABLED != 'false' && steps.tsio-cfg.outputs.config != ''
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TSIO_CONFIG: ${{ steps.tsio-cfg.outputs.config }}
           E2E_OVERRIDE: ${{ steps.e2e-override.outputs.override }}
+          JOB_STATUS: ${{ job.status }}
+          FAILURES: ${{ steps.summary.outputs.FAILURES }}
+          ERRORS: ${{ steps.summary.outputs.ERRORS }}
+          TOTAL: ${{ steps.summary.outputs.TOTAL }}
+          NO_REPORT: ${{ steps.summary.outputs.NO_REPORT }}
+          # The runs e2e-detox-pr.yml triages (its tsio-triage job), so a red lane
+          # says triage is coming instead of looking final.
+          ANNOUNCE_TRIAGE: ${{ (inputs.run-type == 'PR' || inputs.run-type == 'MAIN' || inputs.run-type == 'MASTER') && (vars.E2E_TRIAGE_MODE || 'enforce') == 'enforce' && steps.e2e-override.outputs.triage_report_only == 'false' }}
           MATTERMOST_E2E_WEBHOOK_URL: ${{ secrets.MM_MOBILE_E2E_WEBHOOK_URL }}
           MATTERMOST_MASTER_HEALTH_WEBHOOK_URL: ${{ secrets.MM_E2E_MASTER_HEALTH_WEBHOOK_URL }}
           MATTERMOST_CMT_WEBHOOK_URL: ${{ secrets.MM_E2E_RELEASE_WEBHOOK_URL }}
         run: |
           set +e
           UPSTREAM="true"
-          if [ "${{ job.status }}" = "cancelled" ]; then UPSTREAM="false"; fi
+          CANCELLED="false"
+          if [ "$JOB_STATUS" = "cancelled" ]; then
+            UPSTREAM="false"
+            CANCELLED="true"
+          elif [ "$JOB_STATUS" != "success" ] ||
+               [ "${NO_REPORT:-}" = "true" ] ||
+               [ "${FAILURES:-0}" = "-1" ] ||
+               [ "${FAILURES:-0}" -gt 0 ] ||
+               [ "${ERRORS:-0}" -gt 0 ] ||
+               [ "${TOTAL:-0}" -eq 0 ]; then
+            UPSTREAM="false"
+          fi
           IDENTITY=$(echo "$TSIO_CONFIG" | jq -c '.composite_identity')
           CONTEXT=$(echo "$TSIO_CONFIG" | jq -r '.status_context // "e2e-test/maestro-ios"')
-          TOTAL=$(echo "$TSIO_CONFIG" | jq -r '.total_reports_expected // 1')
+          TOTAL_REPORTS=$(echo "$TSIO_CONFIG" | jq -r '.total_reports_expected // 1')
           node detox/utils/tsio-report-status.js \
             --composite-identity="$IDENTITY" \
-            --total-reports-expected="$TOTAL" \
+            --total-reports-expected="$TOTAL_REPORTS" \
             --github-token="$GITHUB_TOKEN" \
             --context="$CONTEXT" \
             --upstream-succeeded="$UPSTREAM" \
+            --cancelled="$CANCELLED" \
             --e2e-override="$E2E_OVERRIDE" \
+            --announce-triage="$ANNOUNCE_TRIAGE" \
             --poll-attempts=24
           RC=$?
           echo "tsio-report-status exit=$RC upstream_succeeded=$UPSTREAM context=$CONTEXT"
-          if [ "$RC" -ne 0 ] && [ "$UPSTREAM" = "true" ]; then
-            echo "::error::TSIO reported test failures for $CONTEXT"
+          if [ "$RC" -ne 0 ] && [ "$CANCELLED" != "true" ]; then
+            echo "::error::TSIO reported test failures or timed out for $CONTEXT"
             exit 1
           fi
           exit 0
@@ -668,7 +904,9 @@ jobs:
           BUILD_ID: maestro-ios-${{ github.run_id }}
 
       - name: Upload Maestro Report to S3
-        if: always()
+        # A re-run of failed flows reports only to the channel message, not over the run's report. Not on
+        # e2e-test-stack, whose runs report to TSIO only.
+        if: always() && inputs.results-artifact == '' && !inputs.e2e_test_stack
         run: |
           cd detox
           node -e "
@@ -690,10 +928,17 @@ jobs:
         if: always()
         env:
           S3_BUCKET: ${{ env.DETOX_AWS_S3_BUCKET }}
+          E2E_TEST_STACK: ${{ inputs.e2e_test_stack }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           # Point at the HTML report generated above. It's uploaded inside
           # detox/artifacts/maestro-ios/, which lands at the maestro-ios/
           # path segment under the S3 prefix.
+          if [ "$E2E_TEST_STACK" = true ]; then
+            # No S3 report on e2e-test-stack: the run itself.
+            echo "TARGET_URL=${RUN_URL}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           echo "TARGET_URL=https://${S3_BUCKET:-mattermost-detox-report}.s3.amazonaws.com/maestro-ios-${{ github.run_id }}/maestro-ios/maestro-report.html" >> "$GITHUB_OUTPUT"
 
       - name: Record job cancellation
@@ -715,10 +960,11 @@ jobs:
           TOTAL: ${{ steps.summary.outputs.TOTAL }}
           NO_REPORT: ${{ steps.summary.outputs.NO_REPORT }}
           SHARD_CANCELLED: ${{ steps.shard-cancelled.outputs.CANCELLED }}
+          TSIO_STATUS_OUTCOME: ${{ steps.tsio-status.outcome }}
         run: |
           if [[ "${SHARD_CANCELLED}" == "true" ]]; then
             echo "STATUS=error" >> "$GITHUB_OUTPUT"
-          elif [[ "${FAILURES:-0}" == "-1" || "${FAILURES:-0}" -gt 0 || "${ERRORS:-0}" -gt 0 || "${TOTAL:-0}" -eq 0 || "${NO_REPORT:-}" == "true" ]]; then
+          elif [[ "${FAILURES:-0}" == "-1" || "${FAILURES:-0}" -gt 0 || "${ERRORS:-0}" -gt 0 || "${TOTAL:-0}" -eq 0 || "${NO_REPORT:-}" == "true" || "${TSIO_STATUS_OUTCOME:-}" == "failure" ]]; then
             echo "STATUS=failure" >> "$GITHUB_OUTPUT"
           else
             echo "STATUS=success" >> "$GITHUB_OUTPUT"
@@ -744,7 +990,11 @@ jobs:
   e2e-maestro-android:
     # TSIO shard label = job name; prefer tsio-shard-name (e.g. maestro-android-e2e).
     name: ${{ inputs.tsio-shard-name != '' && inputs.tsio-shard-name || 'Maestro E2E Tests (Android)' }}
-    if: ${{ inputs.platform == 'android' }}
+    needs: e2e-test-stack-provision
+    # Today's server: always. e2e-test-stack: once this platform's batch is ready.
+    if: >-
+      !cancelled() && inputs.platform == 'android' &&
+      (!inputs.e2e_test_stack || needs.e2e-test-stack-provision.result == 'success')
     runs-on: ubuntu-latest-8-cores
     timeout-minutes: 90
     outputs:
@@ -757,10 +1007,64 @@ jobs:
       PERCENTAGE: ${{ steps.summary.outputs.PERCENTAGE }}
       CANCELLED: ${{ steps.shard-cancelled.outputs.CANCELLED }}
     steps:
+      # Off e2e-test-stack, the admin comes from the MM_MOBILE_E2E_ADMIN_* secrets.
+      - name: ci/check-admin-secrets
+        if: ${{ !inputs.e2e_test_stack }}
+        run: |
+          if [ -z "$ADMIN_USERNAME" ] || [ -z "$ADMIN_PASSWORD" ]; then
+            echo "::error::MM_MOBILE_E2E_ADMIN_USERNAME and MM_MOBILE_E2E_ADMIN_PASSWORD are required off e2e-test-stack"
+            exit 1
+          fi
+
       - name: Checkout Repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ inputs.MOBILE_VERSION }}
+
+      # e2e-test-stack only: the open action runs on Node 26; prepare-node-deps then switches to the specs' version.
+      - name: ci/e2e-test-stack-setup-node
+        if: inputs.e2e_test_stack
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+          package-manager-cache: false
+
+      # e2e-test-stack only: reads this run's create response, from whichever attempt created the batch.
+      - name: ci/e2e-test-stack-open
+        id: e2e-test-stack-open
+        if: inputs.e2e_test_stack
+        uses: mattermost/mattermost-test-automation-toolkit/actions/e2e-test-stack/open@d6488ead2b451fe6f6ecf687c4d46467b896b514 # main
+        with:
+          caller-key: mobile
+          batch: ${{ inputs.e2e_test_stack_batch }}
+          index: "0"
+          credentials-key: ${{ secrets.E2E_TEST_STACK_CREDENTIALS_KEY }}
+
+      # e2e-test-stack only: the batch's server as SITE_1, with its admin, in place of MM_TEST_SERVER_URL and the
+      # MM_MOBILE_E2E_ADMIN_* secrets.
+      - name: ci/e2e-test-stack-server
+        if: inputs.e2e_test_stack
+        env:
+          BATCH: ${{ inputs.e2e_test_stack_batch }}
+          INSTANCES: ${{ steps.e2e-test-stack-open.outputs.instances }}
+        run: |
+          set -euo pipefail
+          field() { jq -r --arg f "$1" '.[0][$f] // ""' <<< "$INSTANCES"; }
+          site=$(field site_url)
+          username=$(field admin_username)
+          password=$(field admin_password)
+          email=$(field admin_email)
+          if [ -z "$site" ] || [ -z "$username" ] || [ -z "$password" ]; then
+            echo "::error::the ${BATCH} batch has no server with a site and an admin"
+            exit 1
+          fi
+          {
+            echo "SITE_1_URL=$site"
+            echo "ADMIN_USERNAME=$username"
+            echo "ADMIN_PASSWORD=$password"
+            echo "ADMIN_EMAIL=$email"
+          } >> "$GITHUB_ENV"
+          echo "SITE_1=$site"
 
       - name: Install system dependencies
         timeout-minutes: 6
@@ -780,7 +1084,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.maestro
-          key: maestro-00f516729f57d48f36ded55244cfbe358ada6b00-linux
+          key: maestro-c8c361be1cc89b2e742f185466a302a22778be6b-linux
 
       - name: Install Maestro CLI
         if: steps.maestro-cache.outputs.cache-hit != 'true'
@@ -965,7 +1269,8 @@ jobs:
         run: |
           mkdir -p build
           adb logcat -c || true
-          adb logcat -v threadtime > build/android-logcat.log 2> build/android-logcat.err &
+          # Full UTC dates, so triage evidence can match app errors to the flow that failed.
+          adb logcat -v threadtime -v year -v UTC > build/android-logcat.log 2> build/android-logcat.err &
           echo $! > build/android-logcat.pid
           echo "==> logcat capture started (pid $(cat build/android-logcat.pid))"
 
@@ -1005,7 +1310,8 @@ jobs:
         # restores it in onFlowComplete, so it must not share a batch with attach_logs.yml.
         # continue-on-error keeps the main batch report authoritative.
         # Skip when seed never wrote the env file (e.g. inactive Matterwick site).
-        if: always() && hashFiles('detox/maestro/.maestro-test-env.sh') != ''
+        # A re-run of failed flows runs only those (flow-path).
+        if: always() && inputs.results-artifact == '' && hashFiles('detox/maestro/.maestro-test-env.sh') != ''
         continue-on-error: true
         run: |
           set -a
@@ -1025,7 +1331,7 @@ jobs:
           # asserts against a toggle the server never turned off. Same treatment
           # ReportAProblemType already gets below.
           echo "==> Patching SupportSettings.AllowDownloadLogs=false on ${SITE_1_URL}"
-          bash detox/maestro/scripts/apply_client_config_value.sh \
+          CONFIG_DIAGNOSIS_FILE="$RUNNER_TEMP/config-diagnosis.txt" bash detox/maestro/scripts/apply_client_config_value.sh \
             "${SITE_1_URL}" "$ADMIN_TOKEN" '{"SupportSettings":{"AllowDownloadLogs":false}}' \
             AllowDownloadLogs false || {
               rc=$?
@@ -1041,7 +1347,7 @@ jobs:
               bash detox/maestro/scripts/write_maestro_failure_stub.sh \
                 build/maestro-report-T67856_4.xml \
                 detox/maestro/flows/account/attach_logs_disabled_when_download_logs_off.yml \
-                "AllowDownloadLogs=false never reached the client config; the flow's pre-condition was not in force"
+                "AllowDownloadLogs=false never reached the client config; the flow's pre-condition was not in force: $(cat "$RUNNER_TEMP/config-diagnosis.txt" 2>/dev/null)"
               exit 1
             }
 
@@ -1072,18 +1378,18 @@ jobs:
           # # Android copy of the iOS restore step — see that step for the
           # rationale (trap-less hard-kill and skip-path coverage).
           echo "==> Restoring SupportSettings.AllowDownloadLogs=true on ${SITE_1_URL}"
-          curl -f -sS --show-error --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 --retry-connrefused -X PUT \
-            -H "Authorization: Bearer $ADMIN_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d '{"SupportSettings":{"AllowDownloadLogs":true}}' \
-            "${SITE_1_URL}/api/v4/config/patch" > /dev/null && \
+          # Not curl --retry: a timed-out patch is still applied, and resending queues more saves behind it.
+          bash detox/maestro/scripts/apply_client_config_value.sh \
+            "${SITE_1_URL}" "$ADMIN_TOKEN" '{"SupportSettings":{"AllowDownloadLogs":true}}' \
+            AllowDownloadLogs true && \
             echo "==> Restored AllowDownloadLogs=true"
 
       - name: Run MM-T3261_2 with ReportAProblemType=email (Android)
         # Isolated step: clear Gmail, patch ReportAProblemType=email, run the
         # mail-mode flow, restore on exit. Android-only — iOS simulators have no
         # Mail app. continue-on-error so the main report stays authoritative.
-        if: always() && hashFiles('detox/maestro/.maestro-test-env.sh') != ''
+        # A re-run of failed flows runs only those (flow-path).
+        if: always() && inputs.results-artifact == '' && hashFiles('detox/maestro/.maestro-test-env.sh') != ''
         continue-on-error: true
         run: |
           set -a
@@ -1109,7 +1415,7 @@ jobs:
           # restored 'default' 58 ms before this step patched, the app observed 'default',
           # and handleReport() emailed instead of opening the browser.
           echo "==> Patching SupportSettings.ReportAProblemType=email on ${SITE_1_URL}"
-          bash detox/maestro/scripts/apply_client_config_value.sh \
+          CONFIG_DIAGNOSIS_FILE="$RUNNER_TEMP/config-diagnosis.txt" bash detox/maestro/scripts/apply_client_config_value.sh \
             "${SITE_1_URL}" "$ADMIN_TOKEN" '{"SupportSettings":{"ReportAProblemType":"email","ReportAProblemMail":"e2e-report-a-problem@example.com"}}' \
             ReportAProblemType email || {
               rc=$?
@@ -1127,7 +1433,7 @@ jobs:
               bash detox/maestro/scripts/write_maestro_failure_stub.sh \
                 build/maestro-report-T3261_2.xml \
                 detox/maestro/flows/account/report_problem_mail_mode.yml \
-                "ReportAProblemType=email never reached the client config; the flow's pre-condition was not in force"
+                "ReportAProblemType=email never reached the client config; the flow's pre-condition was not in force: $(cat "$RUNNER_TEMP/config-diagnosis.txt" 2>/dev/null)"
               exit 1
             }
 
@@ -1152,7 +1458,8 @@ jobs:
         # link-mode flow, restore the default on exit. The flow has no onFlowStart hook
         # of its own, so the patch and the trap restore live here. continue-on-error so
         # the main batch report stays authoritative.
-        if: always() && hashFiles('detox/maestro/.maestro-test-env.sh') != ''
+        # A re-run of failed flows runs only those (flow-path).
+        if: always() && inputs.results-artifact == '' && hashFiles('detox/maestro/.maestro-test-env.sh') != ''
         continue-on-error: true
         run: |
           set -a
@@ -1171,7 +1478,7 @@ jobs:
           # restored 'default' 58 ms before this step patched, the app observed 'default',
           # and handleReport() emailed instead of opening the browser.
           echo "==> Patching SupportSettings.ReportAProblemType=link on ${SITE_1_URL}"
-          bash detox/maestro/scripts/apply_client_config_value.sh \
+          CONFIG_DIAGNOSIS_FILE="$RUNNER_TEMP/config-diagnosis.txt" bash detox/maestro/scripts/apply_client_config_value.sh \
             "${SITE_1_URL}" "$ADMIN_TOKEN" '{"SupportSettings":{"ReportAProblemType":"link","ReportAProblemLink":"https://mattermost.com/pl/report_a_problem_licensed"}}' \
             ReportAProblemType link || {
               rc=$?
@@ -1189,7 +1496,7 @@ jobs:
               bash detox/maestro/scripts/write_maestro_failure_stub.sh \
                 build/maestro-report-T3261_1.xml \
                 detox/maestro/flows/account/report_problem_link_mode.yml \
-                "ReportAProblemType=link never reached the client config; the flow's pre-condition was not in force"
+                "ReportAProblemType=link never reached the client config; the flow's pre-condition was not in force: $(cat "$RUNNER_TEMP/config-diagnosis.txt" 2>/dev/null)"
               exit 1
             }
 
@@ -1225,7 +1532,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: maestro-android-results-${{ github.run_id }}
+          # A re-run of failed flows runs in the same workflow run: its own name.
+          name: maestro-android-results-${{ github.run_id }}${{ inputs.results-artifact != '' && '-rerun' || '' }}
           path: build/
 
       - name: Parse Maestro Report
@@ -1276,6 +1584,45 @@ jobs:
             }
           "
 
+      # Evidence for the triage job in e2e-detox-pr.yml: each failed flow's failure
+      # screenshot, the step it stopped at and the errors the app logged meanwhile.
+      # A re-run of failed flows hands its per-flow results to the channel message.
+      - name: Upload re-run results
+        if: always() && inputs.results-artifact != '' && hashFiles('build/maestro-report.xml') != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.results-artifact }}
+          path: build/maestro-report.xml
+          retention-days: 1
+
+      - name: Collect triage evidence
+        if: always() && inputs.tsio-shard-name != '' && hashFiles('build/maestro-report.xml') != ''
+        continue-on-error: true
+        run: node detox/utils/maestro-triage-evidence.js --report build/maestro-report.xml --build build --device-log build/android-logcat.log --dir build/triage-evidence --out build/triage-evidence/evidence.json
+
+      - name: Upload triage evidence
+        id: upload-evidence
+        if: always() && inputs.tsio-shard-name != '' && hashFiles('build/triage-evidence/*.json') != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: triage-evidence-${{ inputs.tsio-shard-name }}-${{ github.run_id }}
+          path: build/triage-evidence/
+          overwrite: true
+
+      # The artifact service times out now and then ("Failed to CreateArtifact:
+      # ETIMEDOUT") and upload-artifact does not retry, which leaves triage with
+      # no evidence for this lane.
+      - name: Upload triage evidence (retry)
+        if: always() && steps.upload-evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: triage-evidence-${{ inputs.tsio-shard-name }}-${{ github.run_id }}
+          path: build/triage-evidence/
+          overwrite: true
+
       - name: Write TSIO failure stub when Maestro report is missing
         if: always() && inputs.tsio-config != '' && vars.TSIO_UPLOAD_ENABLED != 'false' && hashFiles('build/maestro-report.xml') == ''
         env:
@@ -1305,7 +1652,7 @@ jobs:
       # TSIO accepts framework=maestro (JUnit XML) since mattermost-test-system-io#76.
       - name: Upload report to Test System IO
         if: always() && inputs.tsio-config != '' && vars.TSIO_UPLOAD_ENABLED != 'false' && hashFiles('build/maestro-report.xml') != '' && steps.tsio-cfg.outputs.config != ''
-        uses: mattermost/mattermost-test-system-io/.github/actions/test-system-io-report-upload@0661accd8cc9ab9dde6ec93f6f5ad40d06deb0d3 # release-0.14.0 / main@0661acc (#93 unique release tags per run)
+        uses: mattermost/mattermost-test-system-io/.github/actions/test-system-io-report-upload@3212731263d782a3993dbdf4c8c54f143e69a7b2 # release-0.16.0 / main@3212731
         with:
           composite-identity: ${{ toJSON(fromJSON(steps.tsio-cfg.outputs.config).composite_identity) }}
           total-reports-expected: ${{ fromJSON(steps.tsio-cfg.outputs.config).total_reports_expected }}
@@ -1323,36 +1670,59 @@ jobs:
         if: always() && inputs.tsio-config != '' && vars.TSIO_UPLOAD_ENABLED != 'false' && steps.tsio-cfg.outputs.config != ''
         uses: ./.github/actions/e2e-override-label
         with:
-          pr_number: ${{ fromJSON(steps.tsio-cfg.outputs.config).composite_identity.gh_pr_number }}
+          # A trial e2e-test-stack/<lane> status is never overridden: it gates nothing.
+          pr_number: ${{ !startsWith(fromJSON(steps.tsio-cfg.outputs.config).status_context, 'e2e-test-stack/') && fromJSON(steps.tsio-cfg.outputs.config).composite_identity.gh_pr_number || '' }}
 
       - name: Post per-job TSIO commit status
+        id: tsio-status
         if: always() && inputs.tsio-config != '' && vars.TSIO_UPLOAD_ENABLED != 'false' && steps.tsio-cfg.outputs.config != ''
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TSIO_CONFIG: ${{ steps.tsio-cfg.outputs.config }}
           E2E_OVERRIDE: ${{ steps.e2e-override.outputs.override }}
+          JOB_STATUS: ${{ job.status }}
+          FAILURES: ${{ steps.summary.outputs.FAILURES }}
+          ERRORS: ${{ steps.summary.outputs.ERRORS }}
+          TOTAL: ${{ steps.summary.outputs.TOTAL }}
+          NO_REPORT: ${{ steps.summary.outputs.NO_REPORT }}
+          # The runs e2e-detox-pr.yml triages (its tsio-triage job), so a red lane
+          # says triage is coming instead of looking final.
+          ANNOUNCE_TRIAGE: ${{ (inputs.run-type == 'PR' || inputs.run-type == 'MAIN' || inputs.run-type == 'MASTER') && (vars.E2E_TRIAGE_MODE || 'enforce') == 'enforce' && steps.e2e-override.outputs.triage_report_only == 'false' }}
           MATTERMOST_E2E_WEBHOOK_URL: ${{ secrets.MM_MOBILE_E2E_WEBHOOK_URL }}
           MATTERMOST_MASTER_HEALTH_WEBHOOK_URL: ${{ secrets.MM_E2E_MASTER_HEALTH_WEBHOOK_URL }}
           MATTERMOST_CMT_WEBHOOK_URL: ${{ secrets.MM_E2E_RELEASE_WEBHOOK_URL }}
         run: |
           set +e
           UPSTREAM="true"
-          if [ "${{ job.status }}" = "cancelled" ]; then UPSTREAM="false"; fi
+          CANCELLED="false"
+          if [ "$JOB_STATUS" = "cancelled" ]; then
+            UPSTREAM="false"
+            CANCELLED="true"
+          elif [ "$JOB_STATUS" != "success" ] ||
+               [ "${NO_REPORT:-}" = "true" ] ||
+               [ "${FAILURES:-0}" = "-1" ] ||
+               [ "${FAILURES:-0}" -gt 0 ] ||
+               [ "${ERRORS:-0}" -gt 0 ] ||
+               [ "${TOTAL:-0}" -eq 0 ]; then
+            UPSTREAM="false"
+          fi
           IDENTITY=$(echo "$TSIO_CONFIG" | jq -c '.composite_identity')
           CONTEXT=$(echo "$TSIO_CONFIG" | jq -r '.status_context // "e2e-test/maestro-android"')
-          TOTAL=$(echo "$TSIO_CONFIG" | jq -r '.total_reports_expected // 1')
+          TOTAL_REPORTS=$(echo "$TSIO_CONFIG" | jq -r '.total_reports_expected // 1')
           node detox/utils/tsio-report-status.js \
             --composite-identity="$IDENTITY" \
-            --total-reports-expected="$TOTAL" \
+            --total-reports-expected="$TOTAL_REPORTS" \
             --github-token="$GITHUB_TOKEN" \
             --context="$CONTEXT" \
             --upstream-succeeded="$UPSTREAM" \
+            --cancelled="$CANCELLED" \
             --e2e-override="$E2E_OVERRIDE" \
+            --announce-triage="$ANNOUNCE_TRIAGE" \
             --poll-attempts=24
           RC=$?
           echo "tsio-report-status exit=$RC upstream_succeeded=$UPSTREAM context=$CONTEXT"
-          if [ "$RC" -ne 0 ] && [ "$UPSTREAM" = "true" ]; then
-            echo "::error::TSIO reported test failures for $CONTEXT"
+          if [ "$RC" -ne 0 ] && [ "$CANCELLED" != "true" ]; then
+            echo "::error::TSIO reported test failures or timed out for $CONTEXT"
             exit 1
           fi
           exit 0
@@ -1367,7 +1737,9 @@ jobs:
           BUILD_ID: maestro-android-${{ github.run_id }}
 
       - name: Upload Maestro Report to S3
-        if: always()
+        # A re-run of failed flows reports only to the channel message, not over the run's report. Not on
+        # e2e-test-stack, whose runs report to TSIO only.
+        if: always() && inputs.results-artifact == '' && !inputs.e2e_test_stack
         run: |
           cd detox
           node -e "
@@ -1389,8 +1761,15 @@ jobs:
         if: always()
         env:
           S3_BUCKET: ${{ env.DETOX_AWS_S3_BUCKET }}
+          E2E_TEST_STACK: ${{ inputs.e2e_test_stack }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           # Point at the HTML report generated above.
+          if [ "$E2E_TEST_STACK" = true ]; then
+            # No S3 report on e2e-test-stack: the run itself.
+            echo "TARGET_URL=${RUN_URL}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           echo "TARGET_URL=https://${S3_BUCKET:-mattermost-detox-report}.s3.amazonaws.com/maestro-android-${{ github.run_id }}/maestro-android/maestro-report.html" >> "$GITHUB_OUTPUT"
 
       - name: Record shard cancellation
@@ -1412,10 +1791,11 @@ jobs:
           TOTAL: ${{ steps.summary.outputs.TOTAL }}
           NO_REPORT: ${{ steps.summary.outputs.NO_REPORT }}
           SHARD_CANCELLED: ${{ steps.shard-cancelled.outputs.CANCELLED }}
+          TSIO_STATUS_OUTCOME: ${{ steps.tsio-status.outcome }}
         run: |
           if [[ "${SHARD_CANCELLED}" == "true" ]]; then
             echo "STATUS=error" >> "$GITHUB_OUTPUT"
-          elif [[ "${FAILURES:-0}" == "-1" || "${FAILURES:-0}" -gt 0 || "${ERRORS:-0}" -gt 0 || "${TOTAL:-0}" -eq 0 || "${NO_REPORT:-}" == "true" ]]; then
+          elif [[ "${FAILURES:-0}" == "-1" || "${FAILURES:-0}" -gt 0 || "${ERRORS:-0}" -gt 0 || "${TOTAL:-0}" -eq 0 || "${NO_REPORT:-}" == "true" || "${TSIO_STATUS_OUTCOME:-}" == "failure" ]]; then
             echo "STATUS=failure" >> "$GITHUB_OUTPUT"
           else
             echo "STATUS=success" >> "$GITHUB_OUTPUT"

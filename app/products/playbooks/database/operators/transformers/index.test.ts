@@ -429,6 +429,52 @@ describe('*** PLAYBOOK_RUN Prepare Records Test ***', () => {
         expect(preparedRecord).toBeTruthy();
         expect(preparedRecord.id).toBeTruthy();
     });
+
+    // The server sends a run's events as null, a Go nil slice, when it has none.
+    it.each([
+        ['its own list', [{id: 'event_2'}], [{id: 'event_2'}]],
+        ['null', null, []],
+    ])('=> transformPlaybookRunRecord: should replace stored timeline events when the payload supplies %s', async (_, supplied, expected) => {
+        const timelineEvent: TimelineEvent = {
+            id: 'event_1',
+            playbook_run_id: 'playbook_run_1',
+            create_at: 1620000000000,
+            event_at: 1620000000000,
+            event_type: 'task_state_modified',
+            summary: '',
+            details: JSON.stringify({action: 'check'}),
+            post_id: '',
+            subject_user_id: 'user_1',
+            creator_user_id: 'user_1',
+        };
+        const database = await createTestConnection({databaseName: 'playbook_run_prepare_records', setActive: true});
+
+        let existingRecord: PlaybookRunModel | undefined;
+        await database!.write(async () => {
+            existingRecord = await database!.get<PlaybookRunModel>(PLAYBOOK_RUN).create((record) => {
+                record._raw.id = 'playbook_run_timeline_replace';
+                record.timelineEvents = [timelineEvent];
+            });
+        });
+
+        const preparedRecord = await transformPlaybookRunRecord({
+            action: OperationType.UPDATE,
+            database: database!,
+            value: {
+                record: existingRecord,
+                raw: {
+                    id: 'playbook_run_timeline_replace',
+                    timeline_events: supplied === null ? null : supplied.map((event) => ({...timelineEvent, ...event})),
+                } as PlaybookRun,
+            },
+        });
+
+        await database!.write(async () => {
+            await database!.batch(preparedRecord);
+        });
+
+        expect(preparedRecord.timelineEvents).toEqual(expected.map((event) => ({...timelineEvent, ...event})));
+    });
 });
 
 describe('*** PLAYBOOK_CHECKLIST Prepare Records Test ***', () => {
@@ -614,7 +660,7 @@ describe('*** PLAYBOOK_CHECKLIST Prepare Records Test ***', () => {
 
 describe('*** PLAYBOOK_CHECKLIST_ITEM Prepare Records Test ***', () => {
     it('=> transformPlaybookChecklistItemRecord: should return a record of type PlaybookChecklistItem for CREATE action', async () => {
-        expect.assertions(3);
+        expect.assertions(4);
 
         const database = await createTestConnection({databaseName: 'playbook_checklist_item_prepare_records', setActive: true});
         expect(database).toBeTruthy();
@@ -638,6 +684,7 @@ describe('*** PLAYBOOK_CHECKLIST_ITEM Prepare Records Test ***', () => {
                     due_date: 1620000003000,
                     completed_at: 0,
                     task_actions: [],
+                    requirements: [{id: 'req-1', label: 'Ticket URL', value: ''}],
                     condition_action: '',
                     condition_reason: '',
                     update_at: 0,
@@ -647,6 +694,7 @@ describe('*** PLAYBOOK_CHECKLIST_ITEM Prepare Records Test ***', () => {
 
         expect(preparedRecord).toBeTruthy();
         expect(preparedRecord!.collection.table).toBe(PLAYBOOK_TABLES.PLAYBOOK_CHECKLIST_ITEM);
+        expect(preparedRecord!.requirements).toEqual([{id: 'req-1', label: 'Ticket URL', value: ''}]);
     });
 
     it('=> transformPlaybookChecklistItemRecord: should return a record of type PlaybookChecklistItem for UPDATE action', async () => {

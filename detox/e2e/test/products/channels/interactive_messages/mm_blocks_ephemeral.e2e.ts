@@ -5,9 +5,9 @@ import {MmBlocksTestHelper} from '@support/mm_blocks_test_helper';
 import {
     Channel,
     Post,
-    System,
     User,
 } from '@support/server_api';
+import {assertServerBaseline} from '@support/server_baseline';
 import {siteOneUrl, hasStableWebhookIngress} from '@support/test_config';
 import {
     ChannelScreen,
@@ -163,16 +163,14 @@ describe('Interactive mm_blocks (ephemeral post)', () => {
         await MmBlocksTestHelper.waitForPostText(ephemeralMarker);
         await MmBlocksTestHelper.tapMmBlocksButton('detox_mm_blocks_apply_update');
 
-        await MmBlocksTestHelper.waitForPostText('DETOX_MM_BLOCKS_UPDATED');
+        await MmBlocksTestHelper.waitForTextMatching(MmBlocksTestHelper.UPDATED_MARKER);
 
         await ThreadScreen.back();
     });
 
     itNeedsStableIngress('MM-T6233_1 - should keep username override after integration update in thread', async () => {
         await User.apiAdminLogin(siteOneUrl);
-        await System.apiPatchConfig(siteOneUrl, {
-            ServiceSettings: {EnablePostUsernameOverride: true},
-        });
+        await assertServerBaseline(siteOneUrl, ['ServiceSettings.EnablePostUsernameOverride']);
 
         const anchorMarker = MmBlocksTestHelper.randomMarker('E2E mm_blocks anchor override');
         const ephemeralMarker = MmBlocksTestHelper.randomMarker('E2E mm_blocks ephemeral override');
@@ -215,8 +213,8 @@ describe('Interactive mm_blocks (ephemeral post)', () => {
         await MmBlocksTestHelper.expectPostAuthorName(overrideAuthorName, ephemeralMarker);
 
         await MmBlocksTestHelper.tapMmBlocksButton('detox_mm_blocks_apply_update_eph_override');
-        await MmBlocksTestHelper.waitForPostText('DETOX_MM_BLOCKS_UPDATED');
-        await MmBlocksTestHelper.expectPostAuthorName(overrideAuthorName, 'DETOX_MM_BLOCKS_UPDATED');
+        await MmBlocksTestHelper.waitForTextMatching(MmBlocksTestHelper.UPDATED_MARKER);
+        await MmBlocksTestHelper.expectPostAuthorName(overrideAuthorName, MmBlocksTestHelper.UPDATED_MARKER);
 
         await ThreadScreen.back();
     });
@@ -262,7 +260,7 @@ describe('Interactive mm_blocks (ephemeral post)', () => {
         await MmBlocksTestHelper.waitForPostText(ephemeralMarker);
         await MmBlocksTestHelper.tapMmBlocksButton('detox_mm_blocks_query_btn_eph');
 
-        await MmBlocksTestHelper.waitForTextMatching(/Detox mm_blocks query OK \(cli=from_block&srv=from_action\)/);
+        await MmBlocksTestHelper.waitForTextMatching(MmBlocksTestHelper.reply('query OK (cli=from_block&srv=from_action)'));
         await MmBlocksTestHelper.expectOnlyVisibleToYou();
 
         await ThreadScreen.back();
@@ -309,7 +307,7 @@ describe('Interactive mm_blocks (ephemeral post)', () => {
         await MmBlocksTestHelper.waitForPostText(ephemeralMarker);
         await MmBlocksTestHelper.tapMmBlocksButton('detox_mm_blocks_query_override_eph');
 
-        await MmBlocksTestHelper.waitForTextMatching('Detox mm_blocks query OK (dup=from_block)');
+        await MmBlocksTestHelper.waitForTextMatching(MmBlocksTestHelper.reply('query OK (dup=from_block)'));
 
         await ThreadScreen.back();
     });
@@ -359,7 +357,7 @@ describe('Interactive mm_blocks (ephemeral post)', () => {
         await MmBlocksTestHelper.tapMmBlocksStaticSelect('detox_mm_blocks_static_select_query_eph');
         await MmBlocksTestHelper.selectStaticOption('North');
 
-        await MmBlocksTestHelper.waitForTextMatching(/Detox mm_blocks query OK \(cli=from_block&srv=from_action\)/);
+        await MmBlocksTestHelper.waitForTextMatching(MmBlocksTestHelper.reply('query OK (cli=from_block&srv=from_action)'));
         await MmBlocksTestHelper.expectOnlyVisibleToYou();
 
         await ThreadScreen.back();

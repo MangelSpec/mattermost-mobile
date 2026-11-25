@@ -6,25 +6,28 @@ import {
     markChannelAsViewed, removeCurrentUserFromChannel, setChannelDeleteAt,
     storeMyChannelsForTeam, updateChannelInfoFromChannel, updateMyChannelFromWebsocket, deletePostsForChannel,
 } from '@actions/local/channel';
-import {storePostsForChannel} from '@actions/local/post';
+import {batchRecordsAndDeleteRevokedFiles, storePostsForChannel} from '@actions/local/post';
 import {addChannelToManagedCategoryIfNeeded} from '@actions/remote/category';
 import {fetchMissingDirectChannelsInfo, fetchMyChannel, fetchChannelStats, fetchChannelById, handleKickFromChannel} from '@actions/remote/channel';
 import {fetchPostsForChannel} from '@actions/remote/post';
 import {fetchRolesIfNeeded} from '@actions/remote/role';
 import {fetchUsersByIds, updateUsersNoLongerVisible} from '@actions/remote/user';
+import {invalidateRedactionForChannelMembership} from '@actions/websocket/access_control';
 import {loadCallForChannel, leaveCall} from '@calls/actions/calls';
 import {userLeftChannelErr, userRemovedFromChannelErr} from '@calls/errors';
 import {getCurrentCall} from '@calls/state';
 import {Events, General} from '@constants';
 import DatabaseManager from '@database/manager';
-import {deleteChannelMembership, getChannelById, prepareMyChannelsForTeam, getCurrentChannel} from '@queries/servers/channel';
-import {canViewArchivedChannels, getCurrentChannelId, getCurrentTeamId, setCurrentTeamId} from '@queries/servers/system';
+import {deleteChannelMembership, getChannelById, getMyChannel, prepareMyChannelsForTeam, getCurrentChannel} from '@queries/servers/channel';
+import {canViewArchivedChannels, getCurrentChannelId, getCurrentTeamId, getCurrentUserId, setCurrentTeamId} from '@queries/servers/system';
 import {getCurrentUser, getTeammateNameDisplay, getUserById} from '@queries/servers/user';
 import EphemeralStore from '@store/ephemeral_store';
 import MyChannelModel from '@typings/database/models/servers/my_channel';
 import {logDebug} from '@utils/log';
+import {haveSameRoles} from '@utils/user';
 
 import type {Model} from '@nozbe/watermelondb';
+import type {RevokedFile} from '@typings/database/database';
 
 // Received when current user created a channel in a different client
 export async function handleChannelCreatedEvent(serverUrl: string, msg: any) {
@@ -202,6 +205,9 @@ export async function handleChannelMemberUpdatedEvent(serverUrl: string, msg: an
         const updatedChannelMember: ChannelMembership = JSON.parse(msg.data.channelMember);
         updatedChannelMember.id = updatedChannelMember.channel_id;
 
+        // Read before updateMyChannelFromWebsocket, whose prepareUpdate rewrites the model in place.
+        const previousRoles = (await getMyChannel(operator.database, updatedChannelMember.channel_id))?.roles;
+
         const myMemberModel = await updateMyChannelFromWebsocket(serverUrl, updatedChannelMember, true);
         if (myMemberModel.model) {
             models.push(myMemberModel.model);
@@ -220,6 +226,13 @@ export async function handleChannelMemberUpdatedEvent(serverUrl: string, msg: an
             models.push(...await operator.handleRole({roles: rolesRequest.roles, prepareRecordsOnly: true}));
         }
         await operator.batchRecords(models, 'handleChannelMemberUpdatedEvent');
+
+        // The ABAC subject resolves a channel-scoped role, so a role change can flip file access in this
+        // channel alone. The same event fires for mute, notify props and autotranslation, which cannot.
+        const currentUserId = await getCurrentUserId(operator.database);
+        if (currentUserId === updatedChannelMember.user_id && !haveSameRoles(previousRoles, updatedChannelMember.roles)) {
+            invalidateRedactionForChannelMembership(serverUrl, updatedChannelMember.channel_id);
+        }
     } catch {
         // do nothing
     }
@@ -299,6 +312,7 @@ export async function handleUserAddedToChannelEvent(serverUrl: string, msg: any)
         const {database, operator} = DatabaseManager.getServerDatabaseAndOperator(serverUrl);
         const currentUser = await getCurrentUser(database);
         const models: Model[] = [];
+        const revokedFiles: RevokedFile[] = [];
         let joinedChannel: Channel | undefined;
 
         if (userId === currentUser?.id) {
@@ -324,16 +338,19 @@ export async function handleUserAddedToChannelEvent(serverUrl: string, msg: any)
                 }
             }
 
-            const {posts, order, authors, actionType, previousPostId} = await fetchPostsForChannel(serverUrl, channelId, true);
+            const {posts, order, authors, actionType, previousPostId, redactionVerifiedEpoch} = await fetchPostsForChannel(serverUrl, channelId, true);
             if (posts?.length && order?.length && actionType) {
-                const {models: prepared} = await storePostsForChannel(
+                const {models: prepared, revokedFiles: preparedRevokedFiles} = await storePostsForChannel(
                     serverUrl, channelId,
                     posts, order, previousPostId ?? '',
-                    actionType, authors || [], true,
+                    actionType, authors || [], true, redactionVerifiedEpoch,
                 );
 
                 if (prepared?.length) {
                     models.push(...prepared);
+                }
+                if (preparedRevokedFiles?.length) {
+                    revokedFiles.push(...preparedRevokedFiles);
                 }
             }
 
@@ -355,7 +372,7 @@ export async function handleUserAddedToChannelEvent(serverUrl: string, msg: any)
         }
 
         if (models.length) {
-            await operator.batchRecords(models, 'handleUserAddedToChannelEvent');
+            await batchRecordsAndDeleteRevokedFiles(serverUrl, models, revokedFiles, 'handleUserAddedToChannelEvent');
         }
 
         if (joinedChannel) {
